@@ -1,0 +1,21 @@
+data:
+  url: https://nasa-public-data.s3.amazonaws.com/plot3d_utilities/airfoil-learning-dataset.zip
+  raw_dir: data/raw
+  processed_path: data/processed/airfoil_learning.csv
+  geometry_samples: 50
+  targets: [Cl, Cd]
+  features: [geometry, Alpha, Re, Ncrit]
+split:
+  seed: 42
+  train: 0.70
+  validation: 0.15
+  test: 0.15
+models:
+  polynomial_degree: 2
+  random_forest_estimators: 200
+  mlp_hidden_layers: [128, 64]
+  mlp_max_iter: 500
+outputs:
+  figures_dir: results/figures
+  metrics_dir: results/metrics
+  models_dir: results/models

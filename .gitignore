@@ -1,0 +1,26 @@
+# Local environments and Python cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Downloaded and generated data
+data/raw/*
+data/processed/*
+data/external/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+
+# Experiment outputs
+results/figures/*
+results/metrics/*
+results/models/*
+!results/figures/.gitkeep
+!results/metrics/.gitkeep
+!results/models/.gitkeep
+
+# Notebook-generated state and OS files
+.ipynb_checkpoints/
+.DS_Store
