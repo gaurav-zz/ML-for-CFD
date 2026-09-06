@@ -8,6 +8,8 @@ import json
 import zipfile
 from pathlib import Path
 from urllib.request import urlopen
+
+import numpy as np
 import pandas as pd
 
 from src.geometry.representation import flatten_geometry
@@ -80,8 +82,8 @@ def _load_json_members(archive: zipfile.ZipFile, members: list[zipfile.ZipInfo],
         required_geometry = ("xps", "xss", "yps", "yss")
         if not all(key in document for key in required_geometry) or "polars" not in document:
             raise ValueError(f"JSON member {info.filename!r} lacks required geometry or polars fields.")
-        upper = list(zip(document["xps"], document["yps"]))
-        lower = list(zip(document["xss"], document["yss"]))
+        upper = np.column_stack((document["xss"], document["yss"]))
+        lower = np.column_stack((document["xps"], document["yps"]))
         geometry = flatten_geometry(upper, lower, n_samples=geometry_samples)
         geometry_id = Path(info.filename).stem
         geometry_features = {f"geom_{index:03d}": float(value) for index, value in enumerate(geometry)}
