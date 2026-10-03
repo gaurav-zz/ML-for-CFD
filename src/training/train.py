@@ -7,7 +7,9 @@ import time
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
+from sklearn.multioutput import MultiOutputRegressor
 
 from src.models.gradient_boosting import build_model as build_gb
 from src.models.linear import build_model as build_linear
@@ -23,6 +25,8 @@ def train_model(name: str, x_train, y_train, output_dir: str | Path = "results/m
     if name not in MODEL_BUILDERS:
         raise ValueError(f"Unknown model {name!r}; choose from {sorted(MODEL_BUILDERS)}")
     model = MODEL_BUILDERS[name](**kwargs)
+    if name == "gradient_boosting" and np.ndim(y_train) == 2:
+        model = MultiOutputRegressor(model)
     started = time.perf_counter()
     model.fit(x_train, y_train)
     elapsed = time.perf_counter() - started
