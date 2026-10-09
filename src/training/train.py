@@ -9,7 +9,9 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.preprocessing import StandardScaler
 
 from src.models.gradient_boosting import build_model as build_gb
 from src.models.linear import build_model as build_linear
@@ -21,11 +23,23 @@ from src.models.random_forest import build_model as build_rf
 MODEL_BUILDERS = {"linear": build_linear, "polynomial": build_polynomial, "random_forest": build_rf, "gradient_boosting": build_gb, "mlp": build_mlp}
 
 
-def train_model(name: str, x_train, y_train, output_dir: str | Path = "results/models", **kwargs) -> tuple[object, float]:
+def train_model(
+    name: str,
+    x_train,
+    y_train,
+    output_dir: str | Path = "results/models",
+    *,
+    scale_targets: bool = False,
+    **kwargs,
+) -> tuple[object, float]:
+    """Fit and save a model, optionally standardizing training targets only."""
     if name not in MODEL_BUILDERS:
         raise ValueError(f"Unknown model {name!r}; choose from {sorted(MODEL_BUILDERS)}")
     model = MODEL_BUILDERS[name](**kwargs)
+    if scale_targets:
+        model = TransformedTargetRegressor(regressor=model, transformer=StandardScaler())
     if name == "gradient_boosting" and np.ndim(y_train) == 2:
+        # Each target wrapper sees 1D y, including when the input has just one column.
         model = MultiOutputRegressor(model)
     started = time.perf_counter()
     model.fit(x_train, y_train)
