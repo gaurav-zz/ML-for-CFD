@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pandas as pd
 
 from src.utils.metrics import regression_metrics
 
@@ -43,3 +44,27 @@ def evaluate_model(model, x_test, y_test, target_names: list[str]) -> dict[str, 
         "inference_time_seconds": inference_time,
         "n_predictions": len(prediction),
     }
+
+
+def geometry_metrics(actual, predicted, groups, target_names):
+    """Report each geometry separately so densely sampled airfoils cannot hide others."""
+    actual, predicted = np.asarray(actual), np.asarray(predicted)
+    if actual.ndim == 1:
+        actual = actual[:, None]
+    if predicted.ndim == 1:
+        predicted = predicted[:, None]
+    groups = pd.Series(groups)
+    if (
+        actual.ndim != 2 or predicted.shape != actual.shape
+        or len(groups) != len(actual) or groups.isna().any()
+        or len(target_names) != actual.shape[1]
+    ):
+        raise ValueError("Geometry IDs, predictions, and named targets must have matching shapes.")
+    records = []
+    for geometry_id, indices in groups.groupby(groups, sort=False).indices.items():
+        for index, target in enumerate(target_names):
+            records.append({
+                "geometry_id": geometry_id, "target": target, "n_predictions": len(indices),
+                **regression_metrics(actual[indices, index], predicted[indices, index]),
+            })
+    return pd.DataFrame(records)

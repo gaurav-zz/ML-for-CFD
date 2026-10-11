@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -34,3 +37,34 @@ def validate_geometry(coordinates: np.ndarray, tolerance: float = 1e-6) -> None:
     chord = coordinates[:, 0].max() - coordinates[:, 0].min()
     if chord <= 0 or not np.isclose(chord, 1.0, atol=tolerance):
         raise ValueError("Geometry must be normalized to a unit chord.")
+
+
+def main() -> None:
+    """Validate a processed CSV from the command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=Path("data/processed/airfoil_learning.csv"),
+        help="Path to the processed CSV file.",
+    )
+    args = parser.parse_args()
+
+    if not args.data.exists():
+        raise FileNotFoundError(
+            f"Processed data file not found: {args.data}. "
+            "Run the dataset loader first."
+        )
+
+    frame = pd.read_csv(args.data)
+    validate_dataframe(frame)
+
+    print("Dataset validation passed.")
+    print(f"Rows: {len(frame):,}")
+    print(f"Columns: {len(frame.columns):,}")
+    if "geometry_id" in frame.columns:
+        print(f"Unique geometries: {frame['geometry_id'].nunique():,}")
+
+
+if __name__ == "__main__":
+    main()

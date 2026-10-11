@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 from pathlib import Path
+import re
 import warnings
 
 import joblib
@@ -15,7 +16,7 @@ from sklearn.exceptions import ConvergenceWarning
 
 from src.data.preprocessing import SplitData
 from src.data.validation import validate_dataframe
-from src.training.evaluate import evaluate_model
+from src.training.evaluate import evaluate_model, geometry_metrics
 from src.training.train import MODEL_BUILDERS, train_model
 
 
@@ -50,11 +51,45 @@ DEFAULT_MODEL_CONFIGS = (
     },
 )
 
+MLP_IMPROVEMENT_CONFIGS = tuple(
+    {
+        "id": f"mlp_{budget}", "name": "mlp", "scale_targets": True,
+        "parameters": {
+            "hidden_layers": (64, 32), "max_iter": budget, "batch_size": 1024,
+            "early_stopping": False, "random_state": 42,
+        },
+    }
+    for budget in (100, 200, 400)
+)
+
 METRIC_COLUMNS = [
     "model", "target", "mae", "rmse", "r2",
     "batch_inference_time_seconds", "n_predictions",
 ]
 COMPARISON_COLUMNS = METRIC_COLUMNS[:5] + ["training_time_seconds"] + METRIC_COLUMNS[5:]
+GEOMETRY_COLUMNS = ["model", "geometry_id", "target", "n_predictions", "mae", "rmse", "r2"]
+
+
+def _model_id(value):
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value) is None:
+        raise ValueError("Model IDs must be safe, nonempty names of at most 64 characters.")
+    return value
+
+
+def model_artifact_path(manifest, model_id):
+    """Resolve a named variant or a persisted pre-variant model without arbitrary paths."""
+    model_id = _model_id(model_id)
+    result = manifest["results"].get(model_id, {})
+    if result.get("status") != "success":
+        raise ValueError(f"Selected model {model_id!r} has no successful validation result.")
+    # Published comparison runs before named variants used the family as the ID.
+    family = result.get("family", model_id)
+    if not isinstance(family, str) or family not in MODEL_BUILDERS:
+        raise ValueError(f"Unsupported selected model family: {family!r}.")
+    expected = f"{model_id}/{family}.joblib"
+    if result.get("model_path") != expected:
+        raise ValueError(f"Model artifact path does not match its ID and family: {model_id}")
+    return Path(expected)
 
 
 def _names(values, label):
@@ -144,6 +179,7 @@ def load_baseline_split(processed_path, baseline_run_path):
 def compare_models(
     x_train, y_train, x_validation, y_validation, target_names, output_dir,
     model_configs=None, run_metadata=None,
+    *, train_groups=None, validation_groups=None,
 ):
     """Fit one model at a time and select each target's lowest validation RMSE.
 
@@ -153,17 +189,35 @@ def compare_models(
     target_names = _names(target_names, "target_names")
     _validate_targets(x_train, y_train, target_names)
     _validate_targets(x_validation, y_validation, target_names)
+    if (train_groups is None) != (validation_groups is None):
+        raise ValueError("Provide training and validation geometry IDs together.")
+    if validation_groups is not None:
+        normalized_groups = []
+        for features, values in ((x_train, train_groups), (x_validation, validation_groups)):
+            if isinstance(values, pd.Series) and isinstance(features, pd.DataFrame) and not values.index.equals(features.index):
+                raise ValueError("Geometry ID order must match the feature DataFrame index.")
+            groups = np.asarray(values)
+            if groups.ndim != 1 or len(groups) != len(features) or pd.isna(groups).any():
+                raise ValueError("Provide one nonmissing geometry ID per feature row.")
+            if any(not str(value).strip() for value in groups):
+                raise ValueError("Geometry IDs must not be empty.")
+            normalized_groups.append(groups)
+        train_groups, validation_groups = normalized_groups
+        if set(train_groups).intersection(validation_groups):
+            raise ValueError("Training and validation geometries overlap.")
     configs = list(DEFAULT_MODEL_CONFIGS if model_configs is None else model_configs)
     names = set()
     for config in configs:
-        if not isinstance(config, dict) or set(config) != {"name", "parameters", "scale_targets"}:
-            raise ValueError("Each model config requires name, parameters, and scale_targets.")
+        required = {"name", "parameters", "scale_targets"}
+        if not isinstance(config, dict) or not required.issubset(config) or set(config) - required - {"id"}:
+            raise ValueError("Each model config requires name, parameters, and scale_targets, with an optional id.")
         name = config["name"]
         if not isinstance(name, str) or name not in MODEL_BUILDERS:
             raise ValueError(f"Unsupported model name: {name!r}.")
-        if name in names:
-            raise ValueError("Model config names must be unique.")
-        names.add(name)
+        model_id = _model_id(config.get("id", name))
+        if model_id in names:
+            raise ValueError("Model config IDs must be unique.")
+        names.add(model_id)
         if not isinstance(config["parameters"], dict) or type(config["scale_targets"]) is not bool:
             raise ValueError("Model parameters must be a dict and scale_targets must be a bool.")
         if {"name", "x_train", "y_train", "output_dir", "scale_targets"}.intersection(config["parameters"]):
@@ -177,7 +231,8 @@ def compare_models(
         "selection_metric": "validation_rmse",
         "selected_models": {},
         "results": {
-            config["name"]: {
+            config.get("id", config["name"]): {
+                "family": config["name"],
                 "status": "pending", "parameters": config["parameters"],
                 "scale_targets": config["scale_targets"], "warnings": [],
             }
@@ -189,6 +244,7 @@ def compare_models(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
     rows = []
+    geometry_rows = []
     best_rmse = {}
 
     def checkpoint():
@@ -196,12 +252,18 @@ def compare_models(
         temporary = output / "comparison.csv.tmp"
         table.to_csv(temporary, index=False)
         temporary.replace(output / "comparison.csv")
+        if validation_groups is not None:
+            by_geometry = pd.DataFrame(geometry_rows, columns=GEOMETRY_COLUMNS)
+            temporary = output / "validation_by_geometry.csv.tmp"
+            by_geometry.to_csv(temporary, index=False)
+            temporary.replace(output / "validation_by_geometry.csv")
         _write_json(output / "run.json", manifest)
         return table
 
     checkpoint()
     for index, config in enumerate(configs, start=1):
-        name = config["name"]
+        family = config["name"]
+        name = config.get("id", family)
         result = manifest["results"][name]
         model_dir = output / name
         model_dir.mkdir()
@@ -215,19 +277,37 @@ def compare_models(
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
                 model, elapsed = train_model(
-                    name, x_train, y_train, output_dir=model_dir,
+                    family, x_train, y_train, output_dir=model_dir,
                     scale_targets=config["scale_targets"], **config["parameters"],
                 )
                 evaluation = evaluate_model(model, x_validation, y_validation, target_names)
+                per_geometry = None
+                if validation_groups is not None:
+                    per_geometry = geometry_metrics(
+                        y_validation, model.predict(x_validation), validation_groups, target_names,
+                    )
+                    per_geometry.insert(0, "model", name)
             success = {
                 "status": "success", "training_time_seconds": float(elapsed),
                 "targets": evaluation["targets"],
                 "batch_inference_time_seconds": evaluation["inference_time_seconds"],
                 "n_predictions": evaluation["n_predictions"],
-                "model_path": f"{name}/{name}.joblib",
+                "model_path": f"{name}/{family}.joblib",
             }
+            if family == "mlp":
+                pipeline = model.regressor_ if config["scale_targets"] else model
+                network = pipeline.named_steps["model"]
+                success["training"] = {
+                    "n_iter": int(network.n_iter_), "max_iter": int(network.max_iter),
+                    "hit_iteration_limit": bool(network.n_iter_ >= network.max_iter),
+                    "loss_curve": [float(loss) for loss in network.loss_curve_],
+                    "final_loss": float(network.loss_),
+                    "loss_space": "standardized_targets" if config["scale_targets"] else "original_targets",
+                }
             json.dumps(success, allow_nan=False)
             result.update(success)
+            if per_geometry is not None:
+                geometry_rows.extend(per_geometry.to_dict("records"))
             for target in target_names:
                 scores = evaluation["targets"][target]
                 rows.append({
@@ -277,18 +357,14 @@ def evaluate_selected_models(comparison_dir, x_test, y_test, target_names):
         raise ValueError("A validation-selected winner is required for every target.")
     if manifest["status"] not in ("completed", "completed_with_failures"):
         raise ValueError("Comparison must be completed before evaluating frozen winners on test.")
-    for name in selected.values():
-        if not isinstance(name, str) or name not in MODEL_BUILDERS:
-            raise ValueError(f"Unsupported selected model name: {name!r}.")
-        if manifest["results"].get(name, {}).get("status") != "success":
-            raise ValueError(f"Selected model {name!r} has no successful validation result.")
+    artifacts = {name: model_artifact_path(manifest, name) for name in selected.values()}
 
     rows = {}
     for name in dict.fromkeys(selected[target] for target in target_names):
         print(f"Evaluating selected model {name} on the full test split", flush=True)
         model = None
         try:
-            model = joblib.load(output / name / f"{name}.joblib")
+            model = joblib.load(output / artifacts[name])
             evaluation = evaluate_model(model, x_test, y_test, target_names)
             for target in target_names:
                 if selected[target] == name:

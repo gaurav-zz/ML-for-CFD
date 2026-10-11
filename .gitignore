@@ -14,6 +14,7 @@ data/external/*
 !data/external/.gitkeep
 
 # Experiment outputs
+results/colab/
 results/figures/*
 results/metrics/*
 results/models/*
