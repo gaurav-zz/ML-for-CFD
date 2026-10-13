@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 import sys
 import zipfile
 
@@ -79,7 +80,56 @@ def test_setup_cell_targets_kaggle_paths_not_drive(cells):
     statements = [line for line in setup.splitlines() if not line.strip().startswith("#")]
     assert not any("/kaggle/working" in line for line in statements)
     assert "/kaggle/working" in cells["v2-config"]
-    assert "/kaggle/input" in cells["v2-resolve"]
+    assert "/kaggle/input" in cells["v2-config"]
+
+
+@pytest.mark.parametrize("layout", ["flat", "nested", "deeply-nested"])
+def test_dataset_discovery_does_not_assume_a_mount_depth(cells, kaggle_inputs, tmp_path, layout):
+    """Kaggle has mounted inputs both flat and under /kaggle/input/datasets/."""
+    dataset_dir, project_root = kaggle_inputs
+    relative = {
+        "flat": "airfoil-tables",
+        "nested": "datasets/airfoil-tables",
+        "deeply-nested": "datasets/purplray/airfoil-tables/1",
+    }[layout]
+    input_root = tmp_path / "mount"
+    target = input_root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(dataset_dir, target)
+
+    namespace = {
+        "Path": Path, "PROJECT_ROOT": project_root, "DATASET_DIR": None,
+        "INPUT_ROOT": input_root, "OUTPUT_ROOT": tmp_path / "working",
+    }
+    exec(compile(cells["v2-resolve"], "kaggle:v2-resolve", "exec"), namespace)
+    assert namespace["DATASET_DIR"] == target
+    assert namespace["GEOMETRY_PATH"].is_file() and namespace["POLARS_PATH"].is_file()
+
+
+def test_discovery_error_lists_what_is_actually_mounted(cells, tmp_path):
+    """The first two real runs failed here; the message has to be self-diagnosing."""
+    input_root = tmp_path / "mount"
+    (input_root / "datasets" / "something-else").mkdir(parents=True)
+    (input_root / "datasets" / "something-else" / "unrelated.csv").write_text("a\n")
+    namespace = {
+        "Path": Path, "PROJECT_ROOT": tmp_path, "DATASET_DIR": None,
+        "INPUT_ROOT": input_root, "OUTPUT_ROOT": tmp_path,
+    }
+    with pytest.raises(FileNotFoundError, match="unrelated.csv"):
+        exec(compile(cells["v2-resolve"], "kaggle:v2-resolve", "exec"), namespace)
+
+
+def test_discovery_refuses_an_ambiguous_mount(cells, kaggle_inputs, tmp_path):
+    dataset_dir, project_root = kaggle_inputs
+    input_root = tmp_path / "mount"
+    for name in ("copy-a", "copy-b"):
+        shutil.copytree(dataset_dir, input_root / name)
+    namespace = {
+        "Path": Path, "PROJECT_ROOT": project_root, "DATASET_DIR": None,
+        "INPUT_ROOT": input_root, "OUTPUT_ROOT": tmp_path,
+    }
+    with pytest.raises(RuntimeError, match="Several datasets"):
+        exec(compile(cells["v2-resolve"], "kaggle:v2-resolve", "exec"), namespace)
 
 
 def test_notebook_runs_the_whole_v2_experiment_on_synthetic_tables(
