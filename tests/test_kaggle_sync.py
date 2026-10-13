@@ -1,11 +1,20 @@
 import json
+from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from src.utils import kaggle_sync
-from src.utils.kaggle_sync import PUSH_FILES, pull_run, push_tables, stage_dataset
+from src.utils.kaggle_sync import (
+    PUSH_FILES,
+    kernel_status,
+    pull_run,
+    push_kernel,
+    push_tables,
+    stage_dataset,
+    stage_kernel,
+)
 
 
 class FakeRunner:
@@ -140,3 +149,75 @@ def test_push_files_track_the_loader_table_names():
     from src.data.loaders import GEOMETRY_TABLE, LOAD_REPORT, POLARS_TABLE
 
     assert set(kaggle_sync.PUSH_FILES) == {GEOMETRY_TABLE, POLARS_TABLE, LOAD_REPORT}
+
+
+def test_kernel_metadata_enables_internet_and_attaches_the_dataset(tmp_path):
+    """The notebook clones the source checkout, so it cannot run without egress."""
+    staging = stage_kernel(
+        "me/airfoil-v2-experiment", "me/airfoil-v2", tmp_path / "stage",
+    )
+    metadata = json.loads((staging / "kernel-metadata.json").read_text())
+    assert metadata["id"] == "me/airfoil-v2-experiment"
+    assert metadata["code_file"] == "v2_experiment_kaggle.ipynb"
+    assert metadata["kernel_type"] == "notebook" and metadata["language"] == "python"
+    assert metadata["enable_internet"] is True
+    # Every model in the queue is CPU scikit-learn.
+    assert metadata["enable_gpu"] is False and metadata["enable_tpu"] is False
+    assert metadata["dataset_sources"] == ["me/airfoil-v2"]
+    assert metadata["is_private"] is True
+    assert len(metadata["title"]) >= 5
+    # The notebook itself is uploaded alongside the metadata.
+    assert (staging / "v2_experiment_kaggle.ipynb").is_file()
+
+
+def test_kernel_can_be_published_explicitly(tmp_path):
+    staging = stage_kernel(
+        "me/airfoil-v2-experiment", "me/airfoil-v2", tmp_path / "stage", private=False,
+    )
+    assert json.loads((staging / "kernel-metadata.json").read_text())["is_private"] is False
+
+
+def test_kernel_staging_defaults_to_the_repo_notebook():
+    assert kaggle_sync.DEFAULT_NOTEBOOK.is_file()
+    assert kaggle_sync.DEFAULT_NOTEBOOK.name == "v2_experiment_kaggle.ipynb"
+
+
+def test_kernel_staging_reports_a_missing_notebook(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Notebook not found"):
+        stage_kernel(
+            "me/airfoil-v2-experiment", "me/airfoil-v2", tmp_path / "stage",
+            notebook=tmp_path / "absent.ipynb",
+        )
+
+
+@pytest.mark.parametrize("kernel,dataset", [
+    ("bad", "me/airfoil-v2"),
+    ("me/airfoil-v2-experiment", "bad"),
+])
+def test_kernel_staging_rejects_malformed_references(tmp_path, kernel, dataset):
+    with pytest.raises(ValueError, match="owner/slug"):
+        stage_kernel(kernel, dataset, tmp_path / "stage")
+
+
+def test_pushing_a_kernel_queues_a_run_and_cleans_up_staging(tmp_path):
+    runner = FakeRunner(stdout="Kernel version 1 successfully pushed")
+    output = push_kernel("me/airfoil-v2-experiment", "me/airfoil-v2", runner=runner)
+    command = runner.commands[0]
+    assert command[:3] == ["kaggle", "kernels", "push"]
+    staging = Path(command[command.index("-p") + 1])
+    assert "successfully pushed" in output
+    # Pushing is what starts execution; nothing is left on disk afterwards.
+    assert not staging.exists()
+
+
+def test_kernel_status_asks_kaggle_for_the_run_state():
+    runner = FakeRunner(stdout='has status "complete"')
+    assert "complete" in kernel_status("me/airfoil-v2-experiment", runner=runner)
+    assert runner.commands[0] == [
+        "kaggle", "kernels", "status", "me/airfoil-v2-experiment",
+    ]
+
+
+def test_kernel_status_rejects_a_malformed_reference():
+    with pytest.raises(ValueError, match="owner/slug"):
+        kernel_status("nope", runner=FakeRunner())

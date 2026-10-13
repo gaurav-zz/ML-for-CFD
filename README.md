@@ -202,17 +202,26 @@ python -m src.utils.kaggle_sync push <owner>/<dataset-slug> --create
 Use `--create` only the first time; later runs omit it to add a new version. Only the two
 tables and the report are uploaded — never the raw archive or model weights.
 
-### 3. Run the experiment on Kaggle
+### 3. Create and run the notebook on Kaggle
 
 The notebook clones this repo inside the Kaggle session, so **the branch it pins
 (`REPO_BRANCH`, currently `v2-physical-geometry`) must be pushed to GitHub first** —
 otherwise the setup cell fails on `git clone`.
 
-Open `notebooks/v2_experiment_kaggle.ipynb` as a Kaggle notebook, then:
+Everything else is CLI-able. Pushing a kernel is what *starts* a run; there is no separate
+run verb, and pushing an existing slug replaces that notebook and runs it again:
 
-1. **Add Input → Datasets** → attach the dataset you just pushed.
-2. **Settings → Internet: On**, so the source checkout can be cloned.
-3. **Save Version → Save & Run All.**
+```bash
+python -m src.utils.kaggle_sync kernel <owner>/<kernel-slug> --dataset <owner>/<dataset-slug>
+python -m src.utils.kaggle_sync status <owner>/<kernel-slug>
+```
+
+This generates `kernel-metadata.json` for you: internet on (needed for the clone), GPU off
+(every model is CPU scikit-learn), the tables dataset attached as the only input, and the
+notebook private unless you pass `--public`.
+
+Equivalently, in the browser: **Add Input → Datasets** → attach the dataset,
+**Settings → Internet: On**, then **Save Version → Save & Run All**.
 
 The notebook clones this repo into Kaggle scratch (not `/kaggle/working`, which becomes
 the kernel output), restores the frozen split, trains the queue, evaluates the frozen

@@ -20,12 +20,16 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 
 from src.data.loaders import GEOMETRY_TABLE, LOAD_REPORT, POLARS_TABLE
 
 PUSH_FILES = (GEOMETRY_TABLE, POLARS_TABLE, LOAD_REPORT)
 DEFAULT_PROCESSED = Path(__file__).resolve().parents[2] / "data" / "processed"
 DEFAULT_RESULTS = Path(__file__).resolve().parents[2] / "results" / "kaggle"
+DEFAULT_NOTEBOOK = (
+    Path(__file__).resolve().parents[2] / "notebooks" / "v2_experiment_kaggle.ipynb"
+)
 # Kaggle refs are "owner/slug"; both parts allow letters, digits, and dashes.
 REFERENCE = re.compile(r"^[A-Za-z0-9][\w-]{0,59}/[A-Za-z0-9][\w-]{0,59}$", re.ASCII)
 
@@ -34,6 +38,12 @@ def _reference(value: str, label: str) -> str:
     if not isinstance(value, str) or not REFERENCE.match(value):
         raise ValueError(f"{label} must look like 'owner/slug', got {value!r}.")
     return value
+
+
+def _title(reference: str, minimum: int) -> str:
+    """Derive a display title from a slug, padded to Kaggle's minimum length."""
+    slug = reference.split("/", 1)[1].replace("-", " ").replace("_", " ").strip()
+    return (slug.title() or "Airfoil tables").ljust(minimum, ".")
 
 
 def _run(command: list[str], runner=subprocess.run) -> str:
@@ -67,11 +77,13 @@ def stage_dataset(dataset: str, staging_dir: Path, processed_dir: Path = DEFAULT
     staging_dir.mkdir(parents=True, exist_ok=True)
     for name in PUSH_FILES:
         shutil.copy2(processed_dir / name, staging_dir / name)
-    # Kaggle requires a title of at least six characters.
-    title = dataset.split("/", 1)[1].replace("-", " ").strip() or "airfoil tables"
     (staging_dir / "dataset-metadata.json").write_text(
         json.dumps(
-            {"id": dataset, "title": title.title().ljust(6, "."), "licenses": [{"name": "CC0-1.0"}]},
+            {
+                "id": dataset,
+                "title": _title(dataset, 6),
+                "licenses": [{"name": "CC0-1.0"}],
+            },
             indent=2,
         )
         + "\n",
@@ -104,6 +116,76 @@ def push_tables(
         return _run(command, runner)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def stage_kernel(
+    kernel: str,
+    dataset: str,
+    staging_dir: Path,
+    notebook: Path = DEFAULT_NOTEBOOK,
+    private: bool = True,
+) -> Path:
+    """Write the notebook and its ``kernel-metadata.json`` into a clean folder.
+
+    Internet is enabled because the notebook clones the source checkout inside
+    the session, and the tables dataset is attached as its only input. No GPU:
+    every model in the queue is a CPU scikit-learn estimator.
+    """
+    _reference(kernel, "kernel")
+    _reference(dataset, "dataset")
+    notebook, staging_dir = Path(notebook), Path(staging_dir)
+    if not notebook.is_file():
+        raise FileNotFoundError(f"Notebook not found: {notebook}")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(notebook, staging_dir / notebook.name)
+    (staging_dir / "kernel-metadata.json").write_text(
+        json.dumps(
+            {
+                "id": kernel,
+                "title": _title(kernel, 5),
+                "code_file": notebook.name,
+                "language": "python",
+                "kernel_type": "notebook",
+                "is_private": bool(private),
+                "enable_gpu": False,
+                "enable_tpu": False,
+                "enable_internet": True,
+                "dataset_sources": [dataset],
+                "competition_sources": [],
+                "kernel_sources": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return staging_dir
+
+
+def push_kernel(
+    kernel: str,
+    dataset: str,
+    notebook: Path = DEFAULT_NOTEBOOK,
+    private: bool = True,
+    runner=subprocess.run,
+) -> str:
+    """Upload the notebook and queue a run.
+
+    Pushing *is* what starts execution on Kaggle: there is no separate run verb.
+    Pushing an existing slug replaces that notebook and runs it again.
+    """
+    staging = Path(tempfile.mkdtemp(prefix="kaggle-kernel-"))
+    try:
+        stage_kernel(kernel, dataset, staging, notebook, private)
+        return _run(["kaggle", "kernels", "push", "-p", str(staging)], runner)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def kernel_status(kernel: str, runner=subprocess.run) -> str:
+    """Report whether the queued run is still running, complete, or errored."""
+    _reference(kernel, "kernel")
+    return _run(["kaggle", "kernels", "status", kernel], runner)
 
 
 def pull_run(
@@ -149,6 +231,17 @@ def main() -> None:
     push.add_argument("-m", "--message", help="Version note recorded on Kaggle.")
     push.add_argument("--create", action="store_true", help="Create the dataset for the first time.")
 
+    kernel = subcommands.add_parser("kernel", help="Upload the notebook and queue a run.")
+    kernel.add_argument("kernel", help="Kaggle kernel ref, e.g. yourname/airfoil-v2-experiment.")
+    kernel.add_argument("--dataset", required=True, help="Tables dataset to attach as input.")
+    kernel.add_argument("--notebook", type=Path, default=DEFAULT_NOTEBOOK)
+    kernel.add_argument(
+        "--public", action="store_true", help="Publish the notebook instead of keeping it private.",
+    )
+
+    status = subcommands.add_parser("status", help="Check a queued or finished run.")
+    status.add_argument("kernel", help="Kaggle kernel ref.")
+
     pull = subcommands.add_parser("pull", help="Download a kernel's output files.")
     pull.add_argument("kernel", help="Kaggle kernel ref, e.g. yourname/airfoil-v2-experiment.")
     pull.add_argument("--destination", type=Path, default=DEFAULT_RESULTS)
@@ -157,10 +250,16 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.command == "push":
-            output = push_tables(
-                args.dataset, args.processed_dir, args.message, args.create,
-            )
+            output = push_tables(args.dataset, args.processed_dir, args.message, args.create)
             print(output.strip() or f"Pushed {list(PUSH_FILES)} to {args.dataset}.")
+        elif args.command == "kernel":
+            output = push_kernel(
+                args.kernel, args.dataset, args.notebook, private=not args.public,
+            )
+            print(output.strip() or f"Pushed {args.notebook.name} to {args.kernel}.")
+            print(f"Track it with: python -m src.utils.kaggle_sync status {args.kernel}")
+        elif args.command == "status":
+            print(kernel_status(args.kernel).strip())
         else:
             destination = pull_run(args.kernel, args.destination, args.run_id)
             for path in sorted(destination.iterdir()):
