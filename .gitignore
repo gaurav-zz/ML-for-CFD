@@ -30,3 +30,4 @@ results/models/*
 # Notebook-generated state and OS files
 .ipynb_checkpoints/
 .DS_Store
+HANDOFF.md

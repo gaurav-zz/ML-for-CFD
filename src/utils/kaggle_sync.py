@@ -162,6 +162,12 @@ def stage_kernel(
     return staging_dir
 
 
+def dataset_status(dataset: str, runner=subprocess.run) -> str:
+    """Report whether a dataset's latest version has finished processing."""
+    _reference(dataset, "dataset")
+    return _run(["kaggle", "datasets", "status", dataset], runner).strip()
+
+
 def push_kernel(
     kernel: str,
     dataset: str,
@@ -173,7 +179,19 @@ def push_kernel(
 
     Pushing *is* what starts execution on Kaggle: there is no separate run verb.
     Pushing an existing slug replaces that notebook and runs it again.
+
+    The dataset is checked for readiness first. Kaggle accepts a
+    ``dataset_sources`` entry for a dataset whose first version is still
+    processing, then mounts nothing, so the notebook fails on an empty
+    ``/kaggle/input`` minutes later with no hint as to why.
     """
+    status = dataset_status(dataset, runner)
+    if "ready" not in status.lower():
+        raise RuntimeError(
+            f"Dataset {dataset} reports {status!r}, not ready. Attaching a dataset whose "
+            "version is still processing mounts nothing, and the run fails later with an "
+            "empty /kaggle/input. Wait for 'ready' and push again."
+        )
     staging = Path(tempfile.mkdtemp(prefix="kaggle-kernel-"))
     try:
         stage_kernel(kernel, dataset, staging, notebook, private)

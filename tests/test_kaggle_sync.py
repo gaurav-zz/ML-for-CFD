@@ -200,14 +200,36 @@ def test_kernel_staging_rejects_malformed_references(tmp_path, kernel, dataset):
 
 
 def test_pushing_a_kernel_queues_a_run_and_cleans_up_staging(tmp_path):
-    runner = FakeRunner(stdout="Kernel version 1 successfully pushed")
+    runner = FakeRunner(stdout="ready")
     output = push_kernel("me/airfoil-v2-experiment", "me/airfoil-v2", runner=runner)
-    command = runner.commands[0]
+    # Readiness is checked before anything is uploaded.
+    assert runner.commands[0] == ["kaggle", "datasets", "status", "me/airfoil-v2"]
+    command = runner.commands[1]
     assert command[:3] == ["kaggle", "kernels", "push"]
     staging = Path(command[command.index("-p") + 1])
-    assert "successfully pushed" in output
+    assert output.strip() == "ready"
     # Pushing is what starts execution; nothing is left on disk afterwards.
     assert not staging.exists()
+
+
+@pytest.mark.parametrize("status", ["processing", "error", ""])
+def test_pushing_a_kernel_refuses_a_dataset_that_is_not_ready(status):
+    """Kaggle accepts the attach, mounts nothing, and the run fails much later."""
+    runner = FakeRunner(stdout=status)
+    with pytest.raises(RuntimeError, match="not ready"):
+        push_kernel("me/airfoil-v2-experiment", "me/airfoil-v2", runner=runner)
+    # Nothing is uploaded when the input is not usable yet.
+    assert [command[:3] for command in runner.commands] == [
+        ["kaggle", "datasets", "status", "me/airfoil-v2"][:3],
+    ]
+
+
+def test_dataset_status_asks_kaggle_and_validates_the_reference():
+    runner = FakeRunner(stdout="ready\n")
+    assert kaggle_sync.dataset_status("me/airfoil-v2", runner=runner) == "ready"
+    assert runner.commands[0] == ["kaggle", "datasets", "status", "me/airfoil-v2"]
+    with pytest.raises(ValueError, match="owner/slug"):
+        kaggle_sync.dataset_status("nope", runner=FakeRunner())
 
 
 def test_kernel_status_asks_kaggle_for_the_run_state():
