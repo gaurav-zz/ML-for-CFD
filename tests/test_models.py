@@ -159,4 +159,6 @@ def test_target_scaler_training_statistics_and_physical_unit_roundtrip(tmp_path,
 
 def test_metrics():
     metrics = regression_metrics([1, 2], [1, 3])
-    assert set(metrics) == {"mae", "rmse", "r2"}
+    assert set(metrics) == {
+        "mae", "rmse", "r2", "mean_relative_error", "median_relative_error",
+    }

@@ -18,11 +18,20 @@ def test_evaluation_reports_each_target_and_times_one_prediction_batch():
         result = evaluate_model(model, x, actual, target_names=["Cl", "Cd"])
 
     model.predict.assert_called_once_with(x)
-    assert result["targets"]["Cl"] == pytest.approx({"mae": 1.0, "rmse": 1.0, "r2": 0.625})
+    # Relative error skips the zero-valued row, where it is undefined.
+    assert result["targets"]["Cl"] == pytest.approx({
+        "mae": 1.0,
+        "rmse": 1.0,
+        "r2": 0.625,
+        "mean_relative_error": 0.375,
+        "median_relative_error": 0.375,
+    })
     assert result["targets"]["Cd"] == pytest.approx({
         "mae": 0.2 / 3,
         "rmse": np.sqrt(0.02 / 3),
         "r2": 0.75,
+        "mean_relative_error": 0.375,
+        "median_relative_error": 0.375,
     })
     assert result["inference_time_seconds"] == 0.25
     assert result["n_predictions"] == 3
@@ -35,7 +44,10 @@ def test_single_observation_metrics_serialize_undefined_r2_as_null():
         model, np.zeros((1, 1)), np.array([[1.0, 0.02]]), target_names=["Cl", "Cd"],
     )
 
-    assert result["targets"]["Cl"] == {"mae": 0.5, "rmse": 0.5, "r2": None}
+    assert result["targets"]["Cl"] == {
+        "mae": 0.5, "rmse": 0.5, "r2": None,
+        "mean_relative_error": 0.5, "median_relative_error": 0.5,
+    }
     assert result["targets"]["Cd"]["mae"] == pytest.approx(0.01)
     persisted = json.loads(json.dumps(result, allow_nan=False))
     assert persisted["targets"]["Cl"]["r2"] is None
@@ -52,7 +64,10 @@ def test_evaluation_supports_a_named_single_target(column_target):
 
     result = evaluate_model(model, np.zeros((3, 1)), actual, target_names=["Cl"])
 
-    assert result["targets"] == {"Cl": {"mae": 0.0, "rmse": 0.0, "r2": 1.0}}
+    assert result["targets"] == {"Cl": {
+        "mae": 0.0, "rmse": 0.0, "r2": 1.0,
+        "mean_relative_error": 0.0, "median_relative_error": 0.0,
+    }}
 
 
 @pytest.mark.parametrize("names", [["Cl"], ["Cl", "Cl"], ["Cl", ""], "Cl"])

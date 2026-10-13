@@ -1,4 +1,3 @@
-import hashlib
 import json
 from pathlib import Path
 import warnings
@@ -12,6 +11,7 @@ from sklearn.compose import TransformedTargetRegressor
 from sklearn.exceptions import ConvergenceWarning
 
 from src.data.preprocessing import SplitData
+from src.geometry.descriptors import DESCRIPTOR_NAMES
 from src.training import comparison
 
 
@@ -33,108 +33,191 @@ def read_json(path):
 
 
 @pytest.fixture
-def baseline(tmp_path):
-    frame = pd.DataFrame({
-        "geometry_id": ["foil-c", "foil-a", "foil-b", "foil-c", "foil-d", "foil-a"],
-        "geom_000": [.3, .1, .2, .3, .4, .1],
-        "Alpha": [0., 1., 2., 3., 4., 5.],
+def v2_tables(tmp_path):
+    geometry = pd.DataFrame({
+        "geometry_id": ["foil-a", "foil-b", "foil-c", "foil-d"],
+        "airfoil_name": list("ABCD"),
+        "thickness_000": [0.0, 0.0, 0.0, 0.0],
+        "thickness_001": [.10, .12, .14, .16],
+        "camber_000": [0.0, 0.0, 0.0, 0.0],
+        "camber_001": [.01, .02, .03, .04],
+        **{name: [1., 2., 3., 4.] for name in DESCRIPTOR_NAMES},
+        "clipped_stations": [0, 0, 0, 0],
+    })
+    polars = pd.DataFrame({
+        "geometry_id": ["foil-a", "foil-a", "foil-b", "foil-c", "foil-d", "foil-d"],
+        "Alpha": [0., 4., 2., 6., 1., 8.],
         "Re": [1_000_000.] * 6,
+        "Ncrit": [9.] * 6,
         "Cl": [.1, .2, .3, .4, .5, .6],
         "Cd": [.001, .002, .003, .004, .005, .006],
+        "Cm": [-.01, -.02, -.03, -.04, -.05, -.06],
     })
-    processed = tmp_path / "tiny.csv"
-    frame.to_csv(processed, index=False)
-    metadata = {
-        "dataset": {"sha256": hashlib.sha256(processed.read_bytes()).hexdigest(), "rows": len(frame)},
-        "feature_columns": ["geom_000", "Alpha", "Re"],
-        "target_columns": ["Cl", "Cd"],
-        "split_geometries": {"train": ["foil-a", "foil-d"], "validation": ["foil-c"], "test": ["foil-b"]},
-        "split_rows": {"train": 3, "validation": 2, "test": 1},
-    }
-    run = tmp_path / "run.json"
-    run.write_text(json.dumps(metadata))
-    return frame, processed, run, metadata
+    geometry_path, polars_path = tmp_path / "airfoil_geometry.csv", tmp_path / "airfoil_polars.csv"
+    geometry.to_csv(geometry_path, index=False)
+    polars.to_csv(polars_path, index=False)
+    frozen = tmp_path / "frozen_split.json"
+    frozen.write_text(json.dumps({
+        "git_commit": "a" * 40,
+        "split_geometries": {
+            "train": ["foil-a", "foil-d"], "validation": ["foil-b"], "test": ["foil-c"],
+        },
+        "split_rows": {"train": 4, "validation": 1, "test": 1},
+    }))
+    return geometry_path, polars_path, frozen, polars
 
 
-def test_load_baseline_verifies_hash_and_restores_membership(baseline, monkeypatch):
-    frame, processed, run, metadata = baseline
+def test_frozen_split_assembles_v2_features_and_records_a_new_fingerprint(v2_tables):
+    """v1's CSV hash guard cannot apply once the tables change shape."""
+    geometry_path, polars_path, frozen, polars = v2_tables
+    split, features, targets, metadata = comparison.load_frozen_split(
+        geometry_path, polars_path, frozen,
+    )
+    assert isinstance(split, SplitData)
+    assert targets == ["Cl", "Cd", "Cm"]
+    assert features[:4] == ["thickness_000", "thickness_001", "camber_000", "camber_001"]
+    assert features[-5:] == ["Alpha", "alpha_sin", "alpha_cos", "log10_re", "Ncrit"]
+    assert set(DESCRIPTOR_NAMES).issubset(features)
+    # geometry_id defines the split groups and must never become a feature.
+    assert "geometry_id" not in features and not set(features).intersection(targets)
+
+    assert split.train.geometry_id.tolist() == ["foil-a", "foil-a", "foil-d", "foil-d"]
+    assert metadata["split_rows"] == {"train": 4, "validation": 1, "test": 1}
+    assert metadata["dataset"]["polar_rows"] == len(polars)
+    assert metadata["dataset"]["geometry_rows"] == 4
+    assert len(metadata["dataset"]["geometry_sha256"]) == 64
+    # Explicitly not v1's fingerprint, which described the deleted 1.7 GB CSV.
+    assert metadata["dataset"]["polars_sha256"] != (
+        "b4429f3c97a3d99169d1a17e83606218cdfcebbde2c3bb68ea41fd24e79ee0d4"
+    )
+    assert metadata["baseline_git_commit"] == "a" * 40
+    assert metadata["split_geometries"]["train"] == ["foil-a", "foil-d"]
+
+
+def test_fingerprints_track_each_table_separately(v2_tables):
+    geometry_path, polars_path, frozen, polars = v2_tables
+    before = comparison.load_frozen_split(geometry_path, polars_path, frozen)[3]["dataset"]
+    polars.loc[0, "Cl"] = .999
+    polars.to_csv(polars_path, index=False)
+    after = comparison.load_frozen_split(geometry_path, polars_path, frozen)[3]["dataset"]
+    assert before["polars_sha256"] != after["polars_sha256"]
+    assert before["geometry_sha256"] == after["geometry_sha256"]
+
+
+def test_fingerprints_are_streamed_not_read_whole(v2_tables, monkeypatch):
+    geometry_path, polars_path, frozen, _ = v2_tables
 
     def no_full_read(*args, **kwargs):
-        pytest.fail("The CSV fingerprint must be streamed, not read_bytes().")
+        pytest.fail("Table fingerprints must be streamed, not read_bytes().")
 
     monkeypatch.setattr(Path, "read_bytes", no_full_read)
-    split, features, targets, restored = comparison.load_baseline_split(processed, run)
-    assert isinstance(split, SplitData)
-    assert restored == metadata
-    assert features == metadata["feature_columns"]
-    assert targets == metadata["target_columns"]
-    for partition, ids in metadata["split_geometries"].items():
-        pd.testing.assert_frame_equal(getattr(split, partition), frame.loc[frame.geometry_id.isin(ids)])
+    comparison.load_frozen_split(geometry_path, polars_path, frozen)
 
 
-def test_load_baseline_rejects_changed_csv_before_loading(baseline, monkeypatch):
-    _, processed, run, metadata = baseline
-    metadata["dataset"]["sha256"] = "0" * 64
-    run.write_text(json.dumps(metadata))
-    monkeypatch.setattr(pd, "read_csv", lambda *args, **kwargs: pytest.fail("Hash must be checked first."))
-    with pytest.raises(ValueError, match="SHA256"):
-        comparison.load_baseline_split(processed, run)
+def test_cm_is_available_as_a_third_target_but_can_be_dropped(v2_tables):
+    geometry_path, polars_path, frozen, _ = v2_tables
+    _, _, targets, _ = comparison.load_frozen_split(
+        geometry_path, polars_path, frozen, target_columns=("Cl", "Cd"),
+    )
+    assert targets == ["Cl", "Cd"]
 
 
-@pytest.mark.parametrize("field,key,value,error", [
-    ("dataset", "rows", 7, "Dataset row count"),
-    ("split_rows", "validation", 1, "validation row count"),
-    ("split_geometries", "validation", ["foil-c", "foil-a"], "overlap"),
-    ("split_geometries", "train", ["foil-a", "foil-a", "foil-d"], "unique"),
-    ("split_geometries", "test", [], "nonempty"),
-    ("split_geometries", "test", ["unknown"], "exactly cover"),
-    ("split_geometries", "train", ["foil-a"], "exactly cover"),
-    ("split_geometries", "test", [None], "missing"),
+@pytest.mark.parametrize("targets,error", [
+    (("Cl", "Missing"), "lacks target columns"),
+    (("Cl", "Cl"), "unique"),
+    ((), "nonempty"),
 ])
-def test_load_baseline_rejects_invalid_counts_and_partitions(baseline, field, key, value, error):
-    _, processed, run, metadata = baseline
-    metadata[field][key] = value
-    run.write_text(json.dumps(metadata))
+def test_frozen_split_rejects_bad_target_requests(v2_tables, targets, error):
+    geometry_path, polars_path, frozen, _ = v2_tables
     with pytest.raises(ValueError, match=error):
-        comparison.load_baseline_split(processed, run)
-
-
-@pytest.mark.parametrize("key,value,error", [
-    ("feature_columns", [], "nonempty"),
-    ("feature_columns", ["Alpha", "Alpha"], "unique"),
-    ("feature_columns", [" "], "nonempty"),
-    ("feature_columns", ["geometry_id", "Alpha"], "leakage"),
-    ("feature_columns", ["Alpha", "Cd"], "leakage"),
-    ("feature_columns", ["missing"], "Missing required columns"),
-    ("target_columns", ["Cl", "Cl"], "unique"),
-    ("target_columns", ["Cl", "missing"], "Missing required columns"),
-])
-def test_load_baseline_rejects_bad_columns_and_leakage(baseline, key, value, error):
-    _, processed, run, metadata = baseline
-    metadata[key] = value
-    run.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match=error):
-        comparison.load_baseline_split(processed, run)
+        comparison.load_frozen_split(geometry_path, polars_path, frozen, targets)
 
 
 @pytest.mark.parametrize("column,value,error", [
-    ("geometry_id", None, "geometry_id"),
-    ("geometry_id", " ", "geometry_id"),
-    ("Alpha", np.inf, "infinite"),
-    ("Alpha", "not-numeric", "numeric"),
-    ("Re", -1, "positive"),
+    ("Re", -1., "positive"),
     ("Cd", -.1, "negative"),
+    ("Alpha", np.inf, "infinite"),
+    ("geometry_id", None, "no geometry row"),
 ])
-def test_load_baseline_validates_csv_content(baseline, column, value, error):
-    frame, processed, run, metadata = baseline
-    if isinstance(value, str):
-        frame[column] = frame[column].astype(object)
-    frame.loc[0, column] = value
-    frame.to_csv(processed, index=False)
-    metadata["dataset"]["sha256"] = hashlib.sha256(processed.read_bytes()).hexdigest()
-    run.write_text(json.dumps(metadata))
+def test_frozen_split_validates_polars_content(v2_tables, column, value, error):
+    geometry_path, polars_path, frozen, polars = v2_tables
+    if value is None:
+        polars = polars.astype({column: object})
+    polars.loc[0, column] = value
+    polars.to_csv(polars_path, index=False)
     with pytest.raises(ValueError, match=error):
-        comparison.load_baseline_split(processed, run)
+        comparison.load_frozen_split(geometry_path, polars_path, frozen)
+
+
+def test_frozen_split_requires_a_split_definition(v2_tables, tmp_path):
+    geometry_path, polars_path, _, _ = v2_tables
+    without = tmp_path / "nosplit.json"
+    without.write_text(json.dumps({"git_commit": "a" * 40}))
+    with pytest.raises(ValueError, match="no split_geometries"):
+        comparison.load_frozen_split(geometry_path, polars_path, without)
+
+
+def test_frozen_split_refuses_a_geometry_table_that_misses_airfoils(v2_tables):
+    geometry_path, polars_path, frozen, _ = v2_tables
+    pd.read_csv(geometry_path).head(2).to_csv(geometry_path, index=False)
+    with pytest.raises(ValueError, match="have no geometry row"):
+        comparison.load_frozen_split(geometry_path, polars_path, frozen)
+
+
+def test_frozen_split_refuses_partitions_that_do_not_cover_the_tables(v2_tables):
+    geometry_path, polars_path, frozen, _ = v2_tables
+    definition = json.loads(frozen.read_text())
+    definition["split_geometries"]["train"] = ["foil-a"]
+    frozen.write_text(json.dumps(definition))
+    with pytest.raises(ValueError, match="exactly cover"):
+        comparison.load_frozen_split(geometry_path, polars_path, frozen)
+
+
+def test_log_drag_is_fitted_in_log_space_but_scored_in_physical_units(tmp_path):
+    """The whole point of logging Cd is lost if the metrics stay in log space."""
+    x = np.arange(1, 9, dtype=float)[:, None]
+    # Drag grows geometrically, so a linear fit only works in log space.
+    y = np.column_stack([x[:, 0], 0.001 * 2.0 ** x[:, 0]])
+    output = tmp_path / "comparison"
+    table = comparison.compare_models(
+        x, y, x, y, ["Cl", "Cd"], output,
+        [{"name": "linear", "parameters": {}, "scale_targets": False}],
+        target_transforms={"Cd": "log"},
+    )
+    manifest = read_json(output / "run.json")
+    assert manifest["target_transforms"] == {"Cl": "identity", "Cd": "log"}
+    # Physical units: drag RMSE sits on the scale of Cd itself, not of log(Cd).
+    drag = table.loc[table.target == "Cd"].iloc[0]
+    assert drag["rmse"] < 0.01
+    assert drag["median_relative_error"] < 1e-6
+
+    restored = joblib.load(output / "linear" / "linear.joblib")
+    # The saved model still predicts in log space; the wrapper does the inverting.
+    np.testing.assert_allclose(restored.predict(x[:1]), [[1.0, np.log(0.002)]], rtol=1e-6)
+    test = comparison.evaluate_selected_models(output, x, y, ["Cl", "Cd"])
+    np.testing.assert_allclose(test.rmse, table.rmse, rtol=1e-9)
+    assert read_json(output / "test_evaluation.json")["target_transforms"] == {
+        "Cl": "identity", "Cd": "log",
+    }
+
+
+def test_untransformed_runs_pass_the_target_arrays_straight_through(tmp_path, monkeypatch):
+    """No copy of a 500k-row target matrix just to apply identity."""
+    seen = {}
+
+    def trainer(name, x, y, output_dir, **kwargs):
+        seen["y"] = y
+        model = OffsetRegressor([0.0])
+        joblib.dump(model, output_dir / f"{name}.joblib")
+        return model, .01
+
+    monkeypatch.setattr(comparison, "train_model", trainer)
+    y = np.array([[1.0], [2.0]])
+    comparison.compare_models(
+        y, y, y, y, ["Cl"], tmp_path / "comparison",
+        [{"name": "linear", "parameters": {}, "scale_targets": False}],
+    )
+    assert seen["y"] is y
 
 
 def test_default_queue_is_sequential_and_bounded():

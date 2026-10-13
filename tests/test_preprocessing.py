@@ -1,8 +1,11 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.data.preprocessing import fit_transform_features, geometry_aware_split
+from src.data.preprocessing import apply_frozen_split, fit_transform_features, geometry_aware_split
 
 
 @pytest.mark.parametrize("n_groups,train_size,validation_size,expected_counts", [
@@ -64,3 +67,85 @@ def test_scaler_fits_training_only():
     assert scaler.mean_[0] == 1.0
     assert transformed_train.mean() == 0.0
     assert transformed_validation[0, 0] > 10
+
+
+@pytest.fixture
+def frozen():
+    frame = pd.DataFrame({
+        "geometry_id": ["foil-a", "foil-b", "foil-c", "foil-a", "foil-d"],
+        "value": range(5),
+    })
+    split_geometries = {
+        "train": ["foil-a", "foil-d"], "validation": ["foil-b"], "test": ["foil-c"],
+    }
+    return frame, split_geometries
+
+
+def test_frozen_split_restores_the_exact_partitions(frozen):
+    """v2 changes the features but must not re-roll the held-out geometries."""
+    frame, split_geometries = frozen
+    split = apply_frozen_split(frame, split_geometries)
+    assert split.train.geometry_id.tolist() == ["foil-a", "foil-a", "foil-d"]
+    assert split.validation.geometry_id.tolist() == ["foil-b"]
+    assert split.test.geometry_id.tolist() == ["foil-c"]
+    # Every row lands in exactly one partition, and row order is preserved.
+    pd.testing.assert_frame_equal(
+        pd.concat([split.train, split.validation, split.test]).sort_index(), frame,
+    )
+
+
+def test_frozen_split_keeps_geometries_disjoint_across_partitions(frozen):
+    frame, split_geometries = frozen
+    split = apply_frozen_split(frame, split_geometries)
+    seen = [set(getattr(split, name).geometry_id) for name in ("train", "validation", "test")]
+    assert not seen[0] & seen[1] and not seen[0] & seen[2] and not seen[1] & seen[2]
+    assert set.union(*seen) == set(frame.geometry_id)
+
+
+@pytest.mark.parametrize("partition,ids,error", [
+    ("validation", ["foil-b", "foil-a"], "overlap"),
+    ("train", ["foil-a", "foil-a", "foil-d"], "unique"),
+    ("test", [], "nonempty list"),
+    ("test", [None], "missing or invalid"),
+    ("test", ["unknown"], "exactly cover"),
+    ("train", ["foil-a"], "exactly cover"),
+])
+def test_frozen_split_rejects_leaky_or_incomplete_partitions(frozen, partition, ids, error):
+    frame, split_geometries = frozen
+    split_geometries[partition] = ids
+    with pytest.raises(ValueError, match=error):
+        apply_frozen_split(frame, split_geometries)
+
+
+def test_frozen_split_requires_all_three_named_partitions(frozen):
+    frame, split_geometries = frozen
+    del split_geometries["test"]
+    with pytest.raises(ValueError, match="exactly train, validation, and test"):
+        apply_frozen_split(frame, split_geometries)
+
+
+@pytest.mark.parametrize("value,error", [(None, "missing or empty"), (" ", "missing or empty")])
+def test_frozen_split_rejects_unusable_group_values(frozen, value, error):
+    frame, split_geometries = frozen
+    frame = frame.astype({"geometry_id": object})
+    frame.loc[0, "geometry_id"] = value
+    with pytest.raises(ValueError, match=error):
+        apply_frozen_split(frame, split_geometries)
+
+
+def test_frozen_split_requires_the_group_column(frozen):
+    frame, split_geometries = frozen
+    with pytest.raises(ValueError, match="must contain a geometry_id column"):
+        apply_frozen_split(frame.drop(columns=["geometry_id"]), split_geometries)
+
+
+def test_committed_frozen_split_matches_the_v1_baseline():
+    """The split definition lives in git so a Kaggle run can reproduce it."""
+    path = Path(__file__).resolve().parents[1] / "configs" / "frozen_split.json"
+    frozen = json.loads(path.read_text())
+    split_geometries = frozen["split_geometries"]
+    assert frozen["geometry_counts"] == {"train": 572, "validation": 123, "test": 123}
+    partitions = [set(split_geometries[name]) for name in ("train", "validation", "test")]
+    assert sum(len(part) for part in partitions) == 818
+    assert len(set.union(*partitions)) == 818, "partitions must be disjoint"
+

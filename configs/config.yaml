@@ -1,20 +1,35 @@
 data:
   url: https://nasa-public-data.s3.amazonaws.com/plot3d_utilities/airfoil-learning-dataset.zip
   raw_dir: data/raw
-  processed_path: data/processed/airfoil_learning.csv
+  processed_dir: data/processed
+  geometry_table: airfoil_geometry.csv
+  polars_table: airfoil_polars.csv
   geometry_samples: 50
-  targets: [Cl, Cd]
-  features: [geometry, Alpha, Re, Ncrit]
+  targets: [Cl, Cd, Cm]
+  # Geometry features come from src.geometry (thickness/camber profile plus named
+  # descriptors); flow features come from src.data.features.
+  flow_features: [Alpha, alpha_sin, alpha_cos, log10_re, Ncrit]
 split:
+  # v2 reuses the v1 baseline's geometry partitions verbatim; the fractions below
+  # only apply when generating a fresh split with geometry_aware_split.
+  frozen_split: configs/frozen_split.json
   seed: 42
   train: 0.70
   validation: 0.15
   test: 0.15
-models:
-  polynomial_degree: 2
-  random_forest_estimators: 200
-  mlp_hidden_layers: [128, 64]
-  mlp_max_iter: 500
+targets:
+  # Cd spans a 223x range, so it is fitted as log(Cd) and reported in physical units.
+  transforms:
+    Cl: identity
+    Cd: log
+    Cm: identity
+analysis:
+  stall_alpha_degrees: 12.0
+kaggle:
+  # Set these to your own Kaggle dataset and kernel slugs.
+  dataset: null
+  kernel: null
+  results_dir: results/kaggle
 outputs:
   figures_dir: results/figures
   metrics_dir: results/metrics

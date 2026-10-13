@@ -13,9 +13,11 @@ import numpy as np
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
 
-from src.data.preprocessing import SplitData
+from src.data.features import assemble_features
+from src.data.preprocessing import apply_frozen_split
 from src.data.validation import validate_dataframe
 from src.training.evaluate import evaluate_model
+from src.training.targets import PhysicalPredictor, forward_targets, transform_names
 from src.training.train import MODEL_BUILDERS, train_model
 
 
@@ -50,11 +52,15 @@ DEFAULT_MODEL_CONFIGS = (
     },
 )
 
+SCORE_COLUMNS = ["mae", "rmse", "r2", "mean_relative_error", "median_relative_error"]
 METRIC_COLUMNS = [
-    "model", "target", "mae", "rmse", "r2",
+    "model", "target", *SCORE_COLUMNS,
     "batch_inference_time_seconds", "n_predictions",
 ]
-COMPARISON_COLUMNS = METRIC_COLUMNS[:5] + ["training_time_seconds"] + METRIC_COLUMNS[5:]
+COMPARISON_COLUMNS = [
+    "model", "target", *SCORE_COLUMNS, "training_time_seconds",
+    "batch_inference_time_seconds", "n_predictions",
+]
 
 
 def _names(values, label):
@@ -86,73 +92,110 @@ def _write_json(path, value):
     temporary.replace(path)
 
 
-def load_baseline_split(processed_path, baseline_run_path):
-    """Verify the baseline CSV fingerprint and restore its exact geometry groups.
-
-    ``baseline_run_path`` is the notebook02 ``run.json`` file. Rows retain their
-    CSV order within each partition; no new random split or scaler is fitted.
-    """
-    processed_path = Path(processed_path)
-    with Path(baseline_run_path).open(encoding="utf-8") as source:
-        baseline = json.load(source)
+def _digest(path: Path) -> str:
+    """Stream a file's SHA256, so a large table is never read into memory whole."""
     digest = hashlib.sha256()
-    with processed_path.open("rb") as source:
+    with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
-    if digest.hexdigest() != baseline["dataset"]["sha256"]:
-        raise ValueError("Processed CSV SHA256 does not match the baseline dataset.")
+    return digest.hexdigest()
 
-    features = _names(baseline["feature_columns"], "feature_columns")
-    targets = _names(baseline["target_columns"], "target_columns")
+
+def load_frozen_split(
+    geometry_path, polars_path, baseline_run_path, target_columns=("Cl", "Cd", "Cm"),
+):
+    """Assemble the v2 design matrix and restore v1's frozen geometry partitions.
+
+    v1's monolithic CSV is gone, so its SHA256 guard cannot apply; this records
+    a *new* fingerprint over both v2 tables instead, while reusing the exact
+    geometry ID lists from the baseline run. Reusing those lists is what keeps
+    v2 comparable with v1, and :func:`apply_frozen_split` re-asserts that the
+    partitions are disjoint and cover the dataset exactly.
+
+    Returns the split, the ordered feature names, the target names, and the
+    provenance metadata to record in ``run.json``.
+    """
+    geometry_path, polars_path = Path(geometry_path), Path(polars_path)
+    with Path(baseline_run_path).open(encoding="utf-8") as source:
+        baseline = json.load(source)
+    if "split_geometries" not in baseline:
+        raise ValueError(f"{baseline_run_path} has no split_geometries to restore.")
+
+    targets = _names(list(target_columns), "target_columns")
+    # geometry_id is the join key and the split key: read it as text so an ID
+    # that merely looks numeric is not silently coerced to an integer.
+    polars = pd.read_csv(polars_path, dtype={"geometry_id": str})
+    missing = [name for name in targets if name not in polars.columns]
+    if missing:
+        raise ValueError(
+            f"Polars table lacks target columns {missing}. "
+            "Regenerate the tables, or pass target_columns explicitly."
+        )
+    validate_dataframe(
+        polars,
+        required_columns=list(dict.fromkeys(["geometry_id", "Alpha", "Re", "Cd", *targets])),
+    )
+    geometry = pd.read_csv(geometry_path, dtype={"geometry_id": str})
+    joined, features = assemble_features(polars, geometry)
     if "geometry_id" in features or set(features).intersection(targets):
         raise ValueError("Features must not contain geometry_id or target columns (leakage).")
-    frame = pd.read_csv(processed_path)
-    validate_dataframe(
-        frame, required_columns=list(dict.fromkeys(["geometry_id", "Re", "Cd", *features, *targets])),
-    )
-    if type(baseline["dataset"]["rows"]) is not int or len(frame) != baseline["dataset"]["rows"]:
-        raise ValueError("Dataset row count does not match the baseline dataset rows.")
-    if frame["geometry_id"].isna().any() or frame["geometry_id"].astype(str).str.strip().eq("").any():
-        raise ValueError("Dataset geometry_id values must not be missing or empty.")
-    if not all(pd.api.types.is_numeric_dtype(frame[column]) for column in features + targets):
-        raise ValueError("Feature and target columns must be numeric.")
 
-    partitions = {}
-    seen = set()
-    for partition in ("train", "validation", "test"):
-        ids = baseline["split_geometries"][partition]
-        if not isinstance(ids, list) or not ids:
-            raise ValueError(f"{partition} geometry IDs must be a nonempty list.")
-        if any(not isinstance(value, (str, int, float)) or pd.isna(value) for value in ids):
-            raise ValueError(f"{partition} geometry IDs must not be missing or invalid.")
-        groups = set(ids)
-        if len(groups) != len(ids):
-            raise ValueError(f"{partition} geometry IDs must be unique.")
-        if seen.intersection(groups):
-            raise ValueError("Baseline geometry partitions overlap; groups must be disjoint.")
-        seen.update(groups)
-        partitions[partition] = frame.loc[frame["geometry_id"].isin(groups)].copy()
-    if seen != set(frame["geometry_id"]):
-        raise ValueError("Baseline geometry IDs must exactly cover the dataset, with no missing or extra IDs.")
-    for partition, rows in partitions.items():
-        count = baseline["split_rows"][partition]
-        if type(count) is not int or not len(rows) or len(rows) != count:
-            raise ValueError(f"{partition} row count does not match baseline split_rows.")
-    return SplitData(**partitions), features, targets, baseline
+    split = apply_frozen_split(joined, baseline["split_geometries"])
+    metadata = {
+        "dataset": {
+            "geometry_table": geometry_path.name,
+            "polars_table": polars_path.name,
+            "geometry_sha256": _digest(geometry_path),
+            "polars_sha256": _digest(polars_path),
+            "geometry_rows": int(len(joined["geometry_id"].unique())),
+            "polar_rows": int(len(polars)),
+        },
+        "baseline_run": str(baseline_run_path),
+        "baseline_git_commit": baseline.get("git_commit"),
+        # v1's row counts are recorded for comparison, not enforced: the v2
+        # loader filters non-numeric polars that v1 let through.
+        "baseline_split_rows": baseline.get("split_rows") or baseline.get("v1_split_rows"),
+        "feature_columns": features,
+        "target_columns": targets,
+        "split_geometries": {
+            name: sorted(baseline["split_geometries"][name])
+            for name in ("train", "validation", "test")
+        },
+        "split_rows": {
+            name: int(len(getattr(split, name))) for name in ("train", "validation", "test")
+        },
+    }
+    return split, features, targets, metadata
 
 
 def compare_models(
     x_train, y_train, x_validation, y_validation, target_names, output_dir,
-    model_configs=None, run_metadata=None,
+    model_configs=None, run_metadata=None, target_transforms=None,
 ):
     """Fit one model at a time and select each target's lowest validation RMSE.
 
     Only training and validation data enter this API. Model failures are recorded
     and do not stop later fits; interrupts propagate with prior checkpoints intact.
+
+    ``target_transforms`` maps a target to a fitting-space transform, such as
+    ``{"Cd": "log"}``. Targets are supplied and scored in physical units either
+    way: models are fitted on the transformed values and wrapped so that every
+    number in ``comparison.csv`` stays in original coefficient units. Pass
+    nothing to fit the targets exactly as given.
     """
     target_names = _names(target_names, "target_names")
     _validate_targets(x_train, y_train, target_names)
     _validate_targets(x_validation, y_validation, target_names)
+    transforms = transform_names(target_names, target_transforms)
+    transformed = any(name != "identity" for name in transforms.values())
+    # Leave the arrays untouched when nothing is transformed, so no copy of a
+    # 500k-row training matrix is made just to pass it straight through.
+    fitting_targets = y_train
+    if transformed:
+        fitting_targets = forward_targets(y_train, target_names, target_transforms)
+        if len(target_names) == 1:
+            fitting_targets = fitting_targets[:, 0]
+
     configs = list(DEFAULT_MODEL_CONFIGS if model_configs is None else model_configs)
     names = set()
     for config in configs:
@@ -172,6 +215,7 @@ def compare_models(
     manifest = {
         "run_metadata": {} if run_metadata is None else run_metadata,
         "target_names": target_names,
+        "target_transforms": transforms,
         "model_configs": configs,
         "status": "running",
         "selection_metric": "validation_rmse",
@@ -210,15 +254,20 @@ def compare_models(
         checkpoint()
         print(f"[{index}/{len(configs)}] Starting {name}", flush=True)
         model = None
+        scored = None
         caught = []
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
                 model, elapsed = train_model(
-                    name, x_train, y_train, output_dir=model_dir,
+                    name, x_train, fitting_targets, output_dir=model_dir,
                     scale_targets=config["scale_targets"], **config["parameters"],
                 )
-                evaluation = evaluate_model(model, x_validation, y_validation, target_names)
+                scored = (
+                    PhysicalPredictor(model, target_names, target_transforms)
+                    if transformed else model
+                )
+                evaluation = evaluate_model(scored, x_validation, y_validation, target_names)
             success = {
                 "status": "success", "training_time_seconds": float(elapsed),
                 "targets": evaluation["targets"],
@@ -246,7 +295,9 @@ def compare_models(
             result["warnings"] = [
                 {"category": item.category.__name__, "message": str(item.message)} for item in caught
             ]
-            del model
+            # The scoring wrapper holds the model too, so both must go before
+            # the next fit allocates.
+            del model, scored
             gc.collect()
         _write_json(model_dir / "result.json", result)
         checkpoint()
@@ -264,7 +315,12 @@ def compare_models(
 
 
 def evaluate_selected_models(comparison_dir, x_test, y_test, target_names):
-    """Evaluate frozen validation winners on test, without selecting on test scores."""
+    """Evaluate frozen validation winners on test, without selecting on test scores.
+
+    Targets are supplied in physical units. Saved models hold whatever fitting
+    space they were trained in, so the transforms recorded in ``run.json`` are
+    reapplied in reverse before scoring.
+    """
     output = Path(comparison_dir)
     with (output / "run.json").open(encoding="utf-8") as source:
         manifest = json.load(source)
@@ -272,6 +328,10 @@ def evaluate_selected_models(comparison_dir, x_test, y_test, target_names):
     if target_names != manifest["target_names"]:
         raise ValueError("Test target names and order must match the comparison manifest.")
     _validate_targets(x_test, y_test, target_names)
+    # A manifest without the key predates target transforms, when nothing was
+    # transformed, so identity is the correct reading.
+    transforms = manifest.get("target_transforms") or {}
+    transformed = any(value != "identity" for value in transforms.values())
     selected = manifest["selected_models"]
     if not selected or set(selected) != set(target_names):
         raise ValueError("A validation-selected winner is required for every target.")
@@ -287,9 +347,11 @@ def evaluate_selected_models(comparison_dir, x_test, y_test, target_names):
     for name in dict.fromkeys(selected[target] for target in target_names):
         print(f"Evaluating selected model {name} on the full test split", flush=True)
         model = None
+        scored = None
         try:
             model = joblib.load(output / name / f"{name}.joblib")
-            evaluation = evaluate_model(model, x_test, y_test, target_names)
+            scored = PhysicalPredictor(model, target_names, transforms) if transformed else model
+            evaluation = evaluate_model(scored, x_test, y_test, target_names)
             for target in target_names:
                 if selected[target] == name:
                     rows[target] = {
@@ -298,13 +360,13 @@ def evaluate_selected_models(comparison_dir, x_test, y_test, target_names):
                         "n_predictions": evaluation["n_predictions"],
                     }
         finally:
-            del model
+            del model, scored
             gc.collect()
     records = [rows[target] for target in target_names]
     table = pd.DataFrame(records, columns=METRIC_COLUMNS)
     _write_json(output / "test_evaluation.json", {
         "selection_metric": "validation_rmse", "selected_models": selected,
-        "target_names": target_names, "results": records,
+        "target_names": target_names, "target_transforms": transforms, "results": records,
     })
     table.to_csv(output / "test_metrics.csv", index=False)
     return table

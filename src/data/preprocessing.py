@@ -44,6 +44,51 @@ def geometry_aware_split(frame: pd.DataFrame, groups: pd.Series, seed: int = 42,
     return SplitData(frame.iloc[train_idx].copy(), remainder.iloc[validation_rel].copy(), remainder.iloc[test_rel].copy())
 
 
+def apply_frozen_split(
+    frame: pd.DataFrame, split_geometries: dict, key: str = "geometry_id",
+) -> SplitData:
+    """Restore a previously saved geometry-disjoint split by geometry ID.
+
+    v2 changes the features, the targets, and the dataset fingerprint, but it
+    must not change which airfoil sits in which partition: moving the split
+    would make its numbers incomparable with v1's and would quietly re-roll the
+    held-out geometries that the generalization claim rests on.
+
+    The leakage guarantees are re-asserted here rather than assumed. Partitions
+    must be nonempty, internally unique, mutually disjoint, and must cover every
+    geometry in ``frame`` exactly -- no missing and no extra IDs.
+    """
+    if key not in frame.columns:
+        raise ValueError(f"Frame must contain a {key} column to restore a frozen split.")
+    if frame[key].isna().any() or frame[key].astype(str).str.strip().eq("").any():
+        raise ValueError(f"Dataset {key} values must not be missing or empty.")
+    if set(split_geometries) != {"train", "validation", "test"}:
+        raise ValueError("Frozen split must name exactly train, validation, and test partitions.")
+
+    partitions, seen = {}, set()
+    for partition in ("train", "validation", "test"):
+        ids = split_geometries[partition]
+        if not isinstance(ids, list) or not ids:
+            raise ValueError(f"{partition} geometry IDs must be a nonempty list.")
+        if any(not isinstance(value, (str, int, float)) or pd.isna(value) for value in ids):
+            raise ValueError(f"{partition} geometry IDs must not be missing or invalid.")
+        groups = set(ids)
+        if len(groups) != len(ids):
+            raise ValueError(f"{partition} geometry IDs must be unique.")
+        if seen.intersection(groups):
+            raise ValueError("Frozen geometry partitions overlap; groups must be disjoint.")
+        seen.update(groups)
+        partitions[partition] = frame.loc[frame[key].isin(groups)].copy()
+    if seen != set(frame[key]):
+        raise ValueError(
+            "Frozen geometry IDs must exactly cover the dataset, with no missing or extra IDs."
+        )
+    for partition, rows in partitions.items():
+        if rows.empty:
+            raise ValueError(f"{partition} partition is empty after restoring the frozen split.")
+    return SplitData(**partitions)
+
+
 def fit_transform_features(train: np.ndarray, validation: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
     """Fit a scaler on training features only and transform all partitions."""
     scaler = StandardScaler().fit(train)

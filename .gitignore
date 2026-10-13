@@ -14,12 +14,18 @@ data/external/*
 !data/external/.gitkeep
 
 # Experiment outputs
+results/colab/
+results/kaggle/
 results/figures/*
 results/metrics/*
 results/models/*
 !results/figures/.gitkeep
 !results/metrics/.gitkeep
 !results/models/.gitkeep
+
+# Editor and other tools' local state
+.vscode/
+.kilo/
 
 # Notebook-generated state and OS files
 .ipynb_checkpoints/
