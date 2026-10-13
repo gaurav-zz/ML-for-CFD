@@ -126,6 +126,20 @@ def test_improvement_notebook_validation_reports_reopening_and_opt_in_test(cells
     assert not (validation_snapshot / "test_metrics.csv").exists()
     assert (final_snapshot / "test_metrics.csv").is_file()
 
+    legacy = deepcopy(report)
+    for result in legacy["results"].values():
+        for key in ("tol", "n_iter_no_change", "early_stopping"):
+            del result["training"][key]
+    (output / "run.json").write_text(json.dumps(legacy))
+    displayed = []
+    namespace["display"] = displayed.append
+    execute("improvement-data")
+    execute("improvement-train")
+    displayed.clear()
+    execute("improvement-summary")
+    assert displayed[1]["tolerance"].tolist() == ["not recorded"] * 3
+    assert displayed[1]["patience"].tolist() == ["not recorded"] * 3
+
     altered = deepcopy(report)
     altered["run_metadata"]["feature_columns"] = ["wrong"]
     (output / "run.json").write_text(json.dumps(altered))

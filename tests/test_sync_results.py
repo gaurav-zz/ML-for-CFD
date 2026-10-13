@@ -151,11 +151,12 @@ def test_interrupted_copy_does_not_publish_partial_report(source, tmp_path, monk
     assert not list(destination.glob("**/.report-*"))
 
 
-def test_validation_only_improvements_sync_before_optional_final_test(source, tmp_path):
-    run = source / "mlp_improvement" / "20261011T120000000000Z"
+@pytest.mark.parametrize("experiment", ["mlp_improvement", "mlp_validation"])
+def test_validation_only_improvements_sync_before_optional_final_test(source, tmp_path, experiment):
+    run = source / experiment / "20261011T120000000000Z"
     run.mkdir(parents=True)
     selected = {"Cl": "mlp_200", "Cd": "mlp_400"}
-    for name in reports.REPORT_FILES["mlp_improvement"]:
+    for name in reports.REPORT_FILES[experiment]:
         if name.endswith(".json"):
             (run / name).write_text(json.dumps({
                 "status": "completed", "selected_models": selected, "evaluation_scope": "validation",
@@ -166,7 +167,7 @@ def test_validation_only_improvements_sync_before_optional_final_test(source, tm
             (run / name).write_text("target,rmse\nCl,0.1\n")
     destination = tmp_path / "reports"
     imported = reports.sync_results(source, destination)
-    validation_copy = destination / "mlp_improvement" / run.name
+    validation_copy = destination / experiment / run.name
     assert validation_copy in imported
     assert not (validation_copy / "test_metrics.csv").exists()
     before = {path.name: path.read_bytes() for path in validation_copy.iterdir()}
@@ -174,7 +175,7 @@ def test_validation_only_improvements_sync_before_optional_final_test(source, tm
     (run / "test_evaluation.json").write_text(json.dumps({"selected_models": selected}))
     (run / "test_metrics.csv").write_text("target,rmse\nCl,0.12\n")
     imported = reports.sync_results(source, destination)
-    final_copy = destination / "mlp_improvement" / f"{run.name}_with_test"
+    final_copy = destination / experiment / f"{run.name}_with_test"
     assert final_copy in imported
     assert (final_copy / "test_metrics.csv").read_bytes() == (run / "test_metrics.csv").read_bytes()
     assert {path.name: path.read_bytes() for path in validation_copy.iterdir()} == before

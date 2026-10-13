@@ -19,6 +19,8 @@ REPORT_FILES = {
         "validation_rmse.png", "training_loss.png", "validation_predictions.png", "worst_airfoils.png",
     ),
 }
+REPORT_FILES["mlp_validation"] = REPORT_FILES["mlp_improvement"] + ("validation_history.csv", "validation_curves.png")
+VALIDATION_EXPERIMENTS = ("mlp_improvement", "mlp_validation")
 FINAL_TEST_FILES = ("test_evaluation.json", "test_metrics.csv")
 MAX_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_DESTINATION = Path(__file__).resolve().parents[2] / "results" / "colab"
@@ -52,7 +54,7 @@ def sync_results(source: str | Path, destination: str | Path = DEFAULT_DESTINATI
         for run in sorted(folder.iterdir()):
             if run.is_symlink() or not run.is_dir():
                 continue
-            has_final_test = experiment == "mlp_improvement" and all((run / name).is_file() for name in FINAL_TEST_FILES)
+            has_final_test = experiment in VALIDATION_EXPERIMENTS and all((run / name).is_file() for name in FINAL_TEST_FILES)
             selected_files = filenames + FINAL_TEST_FILES if has_final_test else filenames
             paths = [run / name for name in selected_files]
             if any(path.is_symlink() for path in paths):
@@ -84,15 +86,15 @@ def sync_results(source: str | Path, destination: str | Path = DEFAULT_DESTINATI
                 continue
             if not all(isinstance(value, dict) for value in metadata.values()):
                 continue
-            if experiment in ("model_comparison", "mlp_improvement"):
+            if experiment == "model_comparison" or experiment in VALIDATION_EXPERIMENTS:
                 manifest = metadata["run.json"]
                 if manifest.get("status") not in ("completed", "completed_with_failures"):
                     continue
                 selected = manifest.get("selected_models")
-                summary = metadata["validation_summary.json"] if experiment == "mlp_improvement" else metadata["test_evaluation.json"]
+                summary = metadata["validation_summary.json"] if experiment in VALIDATION_EXPERIMENTS else metadata["test_evaluation.json"]
                 if not selected or selected != summary.get("selected_models"):
                     raise ValueError(f"Validation and report selections disagree in {run}")
-                if experiment == "mlp_improvement" and summary.get("evaluation_scope") != "validation":
+                if experiment in VALIDATION_EXPERIMENTS and summary.get("evaluation_scope") != "validation":
                     raise ValueError(f"Expected validation-only improvement diagnostics in {run}")
                 if has_final_test and selected != metadata["test_evaluation.json"].get("selected_models"):
                     raise ValueError(f"Validation and test selections disagree in {run}")

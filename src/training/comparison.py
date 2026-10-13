@@ -18,6 +18,10 @@ from src.data.preprocessing import SplitData
 from src.data.validation import validate_dataframe
 from src.training.evaluate import evaluate_model, geometry_metrics
 from src.training.train import MODEL_BUILDERS, train_model
+from src.training.validation_mlp import (
+    CONTROLLED_PARAMETERS, DEFAULT_POLICY, train_validation_mlp,
+    validate_geometry_groups, validation_policy,
+)
 
 
 # Polynomial expansion is deliberately excluded: the full training matrix alone
@@ -62,12 +66,25 @@ MLP_IMPROVEMENT_CONFIGS = tuple(
     for budget in (100, 200, 400)
 )
 
+VALIDATION_MLP_CONFIGS = tuple(
+    {
+        "id": name, "name": "mlp", "scale_targets": True,
+        "parameters": {
+            "hidden_layers": (64, 32), "batch_size": 1024,
+            "learning_rate_init": rate, "random_state": 42,
+        },
+        "validation_training": dict(DEFAULT_POLICY),
+    }
+    for name, rate in (("mlp_val_control", 0.001), ("mlp_val_low_lr", 0.0005))
+)
+
 METRIC_COLUMNS = [
     "model", "target", "mae", "rmse", "r2",
     "batch_inference_time_seconds", "n_predictions",
 ]
 COMPARISON_COLUMNS = METRIC_COLUMNS[:5] + ["training_time_seconds"] + METRIC_COLUMNS[5:]
 GEOMETRY_COLUMNS = ["model", "geometry_id", "target", "n_predictions", "mae", "rmse", "r2"]
+HISTORY_COLUMNS = ["model", "epoch", "target", "training_loss", "validation_score", "elapsed_seconds", "mae", "rmse", "r2"]
 
 
 def _model_id(value):
@@ -192,25 +209,15 @@ def compare_models(
     if (train_groups is None) != (validation_groups is None):
         raise ValueError("Provide training and validation geometry IDs together.")
     if validation_groups is not None:
-        normalized_groups = []
-        for features, values in ((x_train, train_groups), (x_validation, validation_groups)):
-            if isinstance(values, pd.Series) and isinstance(features, pd.DataFrame) and not values.index.equals(features.index):
-                raise ValueError("Geometry ID order must match the feature DataFrame index.")
-            groups = np.asarray(values)
-            if groups.ndim != 1 or len(groups) != len(features) or pd.isna(groups).any():
-                raise ValueError("Provide one nonmissing geometry ID per feature row.")
-            if any(not str(value).strip() for value in groups):
-                raise ValueError("Geometry IDs must not be empty.")
-            normalized_groups.append(groups)
-        train_groups, validation_groups = normalized_groups
-        if set(train_groups).intersection(validation_groups):
-            raise ValueError("Training and validation geometries overlap.")
+        train_groups, validation_groups = validate_geometry_groups(
+            x_train, x_validation, train_groups, validation_groups,
+        )
     configs = list(DEFAULT_MODEL_CONFIGS if model_configs is None else model_configs)
     names = set()
     for config in configs:
         required = {"name", "parameters", "scale_targets"}
-        if not isinstance(config, dict) or not required.issubset(config) or set(config) - required - {"id"}:
-            raise ValueError("Each model config requires name, parameters, and scale_targets, with an optional id.")
+        if not isinstance(config, dict) or not required.issubset(config) or set(config) - required - {"id", "validation_training"}:
+            raise ValueError("Each model config requires name, parameters, and scale_targets; id and validation_training are optional.")
         name = config["name"]
         if not isinstance(name, str) or name not in MODEL_BUILDERS:
             raise ValueError(f"Unsupported model name: {name!r}.")
@@ -222,6 +229,12 @@ def compare_models(
             raise ValueError("Model parameters must be a dict and scale_targets must be a bool.")
         if {"name", "x_train", "y_train", "output_dir", "scale_targets"}.intersection(config["parameters"]):
             raise ValueError("Model parameters must not override training inputs or artifact settings.")
+        if "validation_training" in config:
+            validation_policy(config["validation_training"])
+            if name != "mlp" or not config["scale_targets"] or validation_groups is None:
+                raise ValueError("Validation-controlled training requires a scaled MLP and disjoint geometry groups.")
+            if CONTROLLED_PARAMETERS.intersection(config["parameters"]):
+                raise ValueError("Epoch and stopping settings belong in validation_training, not model parameters.")
 
     manifest = {
         "run_metadata": {} if run_metadata is None else run_metadata,
@@ -245,6 +258,7 @@ def compare_models(
     output.mkdir(parents=True, exist_ok=False)
     rows = []
     geometry_rows = []
+    history_rows = []
     best_rmse = {}
 
     def checkpoint():
@@ -257,6 +271,10 @@ def compare_models(
             temporary = output / "validation_by_geometry.csv.tmp"
             by_geometry.to_csv(temporary, index=False)
             temporary.replace(output / "validation_by_geometry.csv")
+        if any("validation_training" in config for config in configs):
+            temporary = output / "validation_history.csv.tmp"
+            pd.DataFrame(history_rows, columns=HISTORY_COLUMNS).to_csv(temporary, index=False)
+            temporary.replace(output / "validation_history.csv")
         _write_json(output / "run.json", manifest)
         return table
 
@@ -273,13 +291,21 @@ def compare_models(
         print(f"[{index}/{len(configs)}] Starting {name}", flush=True)
         model = None
         caught = []
+        epoch_training = None
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
-                model, elapsed = train_model(
-                    family, x_train, y_train, output_dir=model_dir,
-                    scale_targets=config["scale_targets"], **config["parameters"],
-                )
+                if "validation_training" in config:
+                    model, elapsed, epoch_training = train_validation_mlp(
+                        x_train, y_train, x_validation, y_validation, target_names, model_dir,
+                        train_groups=train_groups, validation_groups=validation_groups,
+                        parameters=config["parameters"], policy=config["validation_training"],
+                    )
+                else:
+                    model, elapsed = train_model(
+                        family, x_train, y_train, output_dir=model_dir,
+                        scale_targets=config["scale_targets"], **config["parameters"],
+                    )
                 evaluation = evaluate_model(model, x_validation, y_validation, target_names)
                 per_geometry = None
                 if validation_groups is not None:
@@ -294,18 +320,25 @@ def compare_models(
                 "n_predictions": evaluation["n_predictions"],
                 "model_path": f"{name}/{family}.joblib",
             }
-            if family == "mlp":
+            if epoch_training is not None:
+                success["training"] = epoch_training
+            elif family == "mlp":
                 pipeline = model.regressor_ if config["scale_targets"] else model
                 network = pipeline.named_steps["model"]
                 success["training"] = {
                     "n_iter": int(network.n_iter_), "max_iter": int(network.max_iter),
                     "hit_iteration_limit": bool(network.n_iter_ >= network.max_iter),
+                    "tol": float(network.tol),
+                    "n_iter_no_change": int(network.n_iter_no_change),
+                    "early_stopping": bool(network.early_stopping),
                     "loss_curve": [float(loss) for loss in network.loss_curve_],
                     "final_loss": float(network.loss_),
                     "loss_space": "standardized_targets" if config["scale_targets"] else "original_targets",
                 }
             json.dumps(success, allow_nan=False)
             result.update(success)
+            if epoch_training is not None:
+                history_rows.extend({"model": name, **record} for record in epoch_training["validation_history"])
             if per_geometry is not None:
                 geometry_rows.extend(per_geometry.to_dict("records"))
             for target in target_names:

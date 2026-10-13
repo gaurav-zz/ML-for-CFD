@@ -11,6 +11,9 @@ def build_model(
     batch_size: int | str = "auto",
     early_stopping: bool = True,
     learning_rate_init: float = 0.001,
+    tol: float = 1e-4,
+    n_iter_no_change: int = 10,
+    alpha: float = 0.0001,
 ) -> Pipeline:
     return Pipeline([
         ("scaler", StandardScaler()),
@@ -21,5 +24,8 @@ def build_model(
             batch_size=batch_size,
             early_stopping=early_stopping,
             learning_rate_init=learning_rate_init,
+            tol=tol,
+            n_iter_no_change=n_iter_no_change,
+            alpha=alpha,
         )),
     ])

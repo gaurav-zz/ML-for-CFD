@@ -50,6 +50,9 @@ def test_named_variants_keep_separate_artifacts_losses_and_unseen_geometry_metri
         assert result["training"]["n_iter"] == budget
         assert len(result["training"]["loss_curve"]) == budget
         assert result["training"]["hit_iteration_limit"] is True
+        assert result["training"]["tol"] == 1e-4
+        assert result["training"]["n_iter_no_change"] == 10
+        assert result["training"]["early_stopping"] is False
     by_geometry = pd.read_csv(output / "validation_by_geometry.csv")
     assert set(by_geometry.geometry_id) == set(groups.iloc[24:32])
     assert set(by_geometry.geometry_id).isdisjoint(groups.iloc[:24])
