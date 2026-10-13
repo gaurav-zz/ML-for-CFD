@@ -2,9 +2,9 @@
 
 v1 wrote a single 1.7 GB CSV that repeated 100 geometry columns across all
 768,542 polar rows. Geometry is constant per airfoil, so it is now stored once:
-an 818-row geometry table of about 1 MB, plus a 768k-row polars table of about
-40 MB. That shrinks the payload by roughly forty times, which matters every
-time a Kaggle session starts, and :mod:`src.data.features` joins the two back
+an 818-row geometry table of 1.7 MB, plus a 768k-row polars table of 55 MB.
+That shrinks the upload by about thirty times, which matters every time a
+Kaggle session starts, and :mod:`src.data.features` joins the two back
 together in memory at the point of use.
 
 The archive layout is verified rather than guessed: 825 JSON members under

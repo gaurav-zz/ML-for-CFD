@@ -88,13 +88,14 @@ because geometry is constant per airfoil and v1 repeated 100 columns across all 
 
 | file | rows | size |
 |---|---|---|
-| `data/processed/airfoil_geometry.csv` | 818 | ~1 MB |
-| `data/processed/airfoil_polars.csv` | 768,542 | ~40 MB |
+| `data/processed/airfoil_geometry.csv` | 818 | 1.7 MB |
+| `data/processed/airfoil_polars.csv` | 768,542 | 55 MB |
 | `data/processed/load_report.json` | — | conversion provenance |
 
-That is ~41 MB instead of 1.7 GB, which matters every time a Kaggle session restarts.
-`src/data/features.py` joins them back into a design matrix in memory. Large data files
-are ignored by Git.
+That is a 57 MB upload instead of 1.7 GB — about 30× smaller — which matters every time a
+Kaggle session restarts. `src/data/features.py` joins them back into a design matrix in
+memory (113 features; ~490 MB for the training partition in float64). Large data files are
+ignored by Git.
 
 ## Methodology
 
@@ -202,6 +203,10 @@ Use `--create` only the first time; later runs omit it to add a new version. Onl
 tables and the report are uploaded — never the raw archive or model weights.
 
 ### 3. Run the experiment on Kaggle
+
+The notebook clones this repo inside the Kaggle session, so **the branch it pins
+(`REPO_BRANCH`, currently `v2-physical-geometry`) must be pushed to GitHub first** —
+otherwise the setup cell fails on `git clone`.
 
 Open `notebooks/v2_experiment_kaggle.ipynb` as a Kaggle notebook, then:
 

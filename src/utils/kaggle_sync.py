@@ -7,7 +7,7 @@ processed tables as a dataset version, run the notebook, then pull the kernel
 output back into ``results/kaggle/<run-id>/``.
 
 Only the two processed tables and their load report are ever pushed -- about
-41 MB. The 1.5 GB raw archive stays local, and model weights stay on Kaggle
+57 MB. The 1.5 GB raw archive stays local, and model weights stay on Kaggle
 unless you ask for them.
 """
 
