@@ -13,14 +13,27 @@ below matters more than the choice of model.
 
 ## Status
 
-v2 is implemented and unit-tested. Heavy training runs on Kaggle; the local checkout
-handles data preparation, the transfer to and from Kaggle, and the full test suite.
+The completed Kaggle v2 run (`20261013T115819972797Z`) selected the MLP for all three
+targets. On the frozen test partition of **123 unseen airfoils**, its results are:
 
-**No v2 model results are claimed yet.** The v1 numbers quoted below are real but are
-reported with the caveat that v1's geometry representation was broken — see the next
-section.
+| target | median relative error | RMSE | R² |
+|---|---|---|---|
+| `Cl` | 5.96% | 0.13051 | 0.9709 |
+| `Cd` | 8.11% | 0.01973 | 0.6393 |
+| `Cm` | 12.28% | 0.02182 | 0.8213 |
 
-## The v1 geometry bug, and why v1's scores are optimistic
+Drag validation R² was 0.9224, not the test result. The 66%-thick FX 79-W-660A,
+outside the training thickness range, contributes **80.9% of test drag squared error**.
+The `|Alpha| > 12°` subset has drag R² = -0.173 and median relative error = 9.99%.
+These tail failures must not be hidden by the pooled median or attributed to every
+post-stall prediction equally.
+
+The next accuracy experiment compares that unchanged baseline with GPU-capable,
+literature-inspired neural models. **Training and accuracy comparisons run only on
+Kaggle through the API.** Local checks do not require a PyTorch installation. New
+accuracy gains remain unclaimed until the experiment completes.
+
+## The v1 geometry caveat
 
 `src/geometry/representation.py` used to normalize the upper and lower surfaces
 **independently**, and each normalization subtracted that surface's own mean `y`:
@@ -42,10 +55,12 @@ Thickness and camber were therefore **unrecoverable** from v1's `geom_000..geom_
 features, and the offsets are not stored anywhere, so the old processed CSV could not be
 repaired — only regenerated.
 
-v1 still scored well (test `Cl` R² = 0.977) because 100 numbers still **fingerprint** each
-of the 818 geometries, which lets a flexible model memorize per-geometry behavior. That
-crutch does not exist for an unseen airfoil. **Do not compare v2 geometry results against
-v1's numbers without stating that v1's representation was broken.**
+v1 still scored well (test `Cl` R² = 0.977), so its distorted coordinates retained
+predictive structure despite not being valid physical geometry. Its geometry-disjoint
+test score cannot be explained by memorizing those held-out airfoils. Correcting the
+representation establishes physical validity and interpretability, but does not by
+itself establish an accuracy gain. **State the representation caveat when comparing
+v1 and v2.**
 
 ### What v2 does instead
 
@@ -136,17 +151,42 @@ compares sections on.
 
 ## Models
 
-CPU-compatible scikit-learn factories: Linear Regression, Polynomial + Ridge, Random
-Forest, Histogram Gradient Boosting, and an MLP. The comparison queue trains linear,
-gradient boosting, random forest, and MLP **sequentially**, checkpointing each before the
-next starts.
+CPU-compatible scikit-learn factories remain available: Linear Regression, Polynomial
++ Ridge, Random Forest, Histogram Gradient Boosting, and an MLP. The published v2 queue
+is preserved in `DEFAULT_MODEL_CONFIGS`.
+
+The Kaggle notebook now uses `ACCURACY_MODEL_CONFIGS`: the original MLP baseline plus
+two otherwise-identical CUDA MLPs with MSE versus Huber loss. Inspired by NeuralFoil:
+
+- SiLU layers and RAdam with small weight decay, without dropout or batch normalization.
+- Internal `sin(2 Alpha)` and `sin²(Alpha)` features for separated-flow trends. The
+  original baseline still receives exactly its published 113 features.
+- Exact reflection symmetry: thickness unchanged, camber and angle negated; `Cl` and
+  `Cm` odd, `log(Cd)` even. Symmetry is applied during training and inference, with
+  target-scaling offsets handled in fitting-space units.
+- Huber delta 0.05 **after** training-only standardization of `Cl`, `log(Cd)`, `Cm`.
+  Our configurable target weights `(1, 2, 0.5)` prioritize drag; they are experiment
+  choices, not numerical ratios quoted from the paper.
+- Up to 300 epochs, learning-rate reduction, and restoration of the best
+  **geometry-disjoint validation** checkpoint. Test targets never enter fitting,
+  scheduling, stopping, or winner selection.
+
+The baseline actually stopped at **58 epochs** with `tol=1e-4` and no convergence
+warning. Raising `max_iter` alone would not change that stopping criterion.
+
+Models train sequentially and checkpoint before the next starts. The notebook selects
+drag on validation **median relative error**, and lift/moment on physical-unit RMSE.
+All selection criteria are recorded; the generic comparison API retains RMSE defaults.
+Saved neural weights and inference use NumPy, so pulling a model does not require
+installing PyTorch locally.
 
 Full quadratic expansion is deliberately excluded from the queue: ~113 inputs expand to
 thousands of features, tens of gigabytes for one float64 training matrix at 538k rows.
 
-**Model capacity tuning is explicitly out of scope for v2.** Hyperparameters are held at
-v1's values so the feature and target changes are the only difference. v1's MLP hit its
-`max_iter` and logged a `ConvergenceWarning` while still winning, so headroom remains.
+The completed v2 benchmark held hyperparameters fixed. The new accuracy experiment
+changes physics features, architecture, optimizer, and stopping together versus that
+baseline; only the MSE/Huber pair isolates a single intervention. It is a single-seed
+comparison, not evidence of seed-robust improvements.
 
 ## v1 baseline, for reference only
 
@@ -162,8 +202,8 @@ geometries; 538,380 / 113,678 / 116,484 rows):
 
 Frozen-winner test: `Cl` R² = 0.977, `Cd` R² = 0.926.
 
-Two caveats. The representation was broken, as described above, so these are optimistic
-for the wrong reason. And the `Cd` numbers are flattering in a second way: MAE 0.0049
+Two caveats. The representation was physically invalid, as described above; that alone
+does not prove inflated geometry-disjoint scores. And MAE 0.0049
 against a 1st-percentile `Cd` of 0.006 is roughly an **80% relative error** on low-drag
 cruise airfoils. Reporting relative error alongside absolute is why v2 adds it.
 
@@ -193,7 +233,8 @@ python -m src.data.validation --data data/processed/airfoil_polars.csv
 
 ### 2. Push the tables to Kaggle
 
-Requires the `kaggle` CLI and an API token at `~/.kaggle/kaggle.json`.
+Requires the `kaggle` CLI and Kaggle credentials, such as a token file or
+`~/.kaggle/kaggle.json`.
 
 ```bash
 python -m src.utils.kaggle_sync push <owner>/<dataset-slug> --create
@@ -204,9 +245,11 @@ tables and the report are uploaded — never the raw archive or model weights.
 
 ### 3. Create and run the notebook on Kaggle
 
-The notebook clones this repo inside the Kaggle session, so **the branch it pins
-(`REPO_BRANCH`, currently `v2-physical-geometry`) must be pushed to GitHub first** —
-otherwise the setup cell fails on `git clone`.
+The API helper embeds an allowlisted snapshot of the current training source, tests,
+requirements, and frozen split in the staged notebook. **No Git commit or GitHub push
+is needed to run uncommitted changes.** Data, credentials, local state, and model
+weights are excluded. A SHA256 of the exact source archive is recorded in `run.json`,
+alongside the base Git revision. Browser-only execution retains the Git clone fallback.
 
 Everything else is CLI-able. Pushing a kernel is what *starts* a run; there is no separate
 run verb, and pushing an existing slug replaces that notebook and runs it again:
@@ -216,16 +259,23 @@ python -m src.utils.kaggle_sync kernel <owner>/<kernel-slug> --dataset <owner>/<
 python -m src.utils.kaggle_sync status <owner>/<kernel-slug>
 ```
 
-This generates `kernel-metadata.json` for you: internet on (needed for the clone), GPU off
-(every model is CPU scikit-learn), the tables dataset attached as the only input, and the
-notebook private unless you pass `--public`.
+This generates `kernel-metadata.json`: **GPU on by default**, internet on for Kaggle-only
+dependencies, the tables dataset attached, and a private notebook unless `--public` is
+passed. Optional `--machine-shape NvidiaTeslaT4` requests T4 hardware explicitly; otherwise
+Kaggle chooses the GPU. The notebook checks CUDA and records the actual device. It never
+silently trains GPU candidates on CPU. `--accelerator cpu` explicitly runs the baseline
+only. `requirements-kaggle.txt` is installed on Kaggle, not locally.
 
 Equivalently, in the browser: **Add Input → Datasets** → attach the dataset,
-**Settings → Internet: On**, then **Save Version → Save & Run All**.
+**Settings → Internet: On**, select an available **GPU accelerator**, then
+**Save Version → Save & Run All**. Browser execution needs the source branch pushed.
 
-The notebook clones this repo into Kaggle scratch (not `/kaggle/working`, which becomes
-the kernel output), restores the frozen split, trains the queue, evaluates the frozen
+The notebook extracts the snapshot into Kaggle scratch (not `/kaggle/working`, which
+becomes the kernel output), restores the frozen split, trains the queue, evaluates the frozen
 winners on the test split, and writes metrics, `analysis.json`, and figures.
+The report also separates within/outside training descriptor ranges, matched pre-stall
+`Ncrit=9` cases by Reynolds number, per-airfoil error distributions, and squared-error
+concentration. Descriptor ranges are a diagnostic heuristic, not calibrated uncertainty.
 
 ### 4. Pull the results back
 
@@ -238,10 +288,14 @@ Each pull lands in its own `results/kaggle/<run-id>/` and never overwrites an ex
 ### Testing
 
 ```bash
-pytest
+python -m pytest tests/test_kaggle_sync.py tests/test_kaggle_notebook.py tests/test_analysis.py tests/test_torch_mlp.py -m 'not gpu'
 ```
 
-Covers corrected normalization (non-negative thickness, edge closure, chord scaling,
+The full suite, including model fitting, runs in the Kaggle notebook preflight. The
+local command above checks portable inference and integration without fitting.
+GPU fitting and full notebook integration tests are opt-in on Kaggle; portable inference,
+configuration, transfer, and numerical checks run without local PyTorch. Covers corrected
+normalization (non-negative thickness, edge closure, chord scaling,
 invariance to rotation/scale/translation/point order), descriptors against analytic NACA
 geometry, the two-table loader, feature assembly and leakage guards, the target-transform
 round trip, the new metrics, the frozen-split guards, the Kaggle transfer tool, and an
@@ -276,14 +330,16 @@ tests/                              Unit tests
 
 ## Limitations and Next Steps
 
-- No v2 model results exist yet; the pipeline is implemented and tested, not yet run.
+- New GPU accuracy gains have not yet been measured. The completed v2 test result is
+  reported above, including its extrapolation failure.
 - `Cdp`, `Cp_ps`/`Cp_ss` (100-point pressure distributions), and the `alpha_min`/`max`/
   `step` fields are present in the archive and unused.
 - The leading-edge radius is fitted from the vertical thickness distribution, so for a
   strongly cambered section it runs above the radius measured normal to the camber line.
   It remains a monotonic, physical feature; it is not a certified nose radius.
-- Converging the MLP, cross-validation by geometry, and uncertainty estimates are all
-  deferred.
+- Geometry-fold evaluation, multi-seed uncertainty, additional extreme geometries, and
+  XFOIL panel-resolution label-noise checks remain future work. The frozen test was
+  inspected for diagnosis; new folds or new airfoils are needed for stronger confirmation.
 
 ## Citation
 

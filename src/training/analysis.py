@@ -12,6 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.geometry.descriptors import DESCRIPTOR_NAMES
 from src.utils.metrics import regression_metrics
 
 # XFOIL polars in this archive run to +/-24 degrees and about 17% of rows lie
@@ -21,6 +22,21 @@ STALL_ALPHA = 12.0
 
 PREDICTED_SUFFIX = "_predicted"
 ERROR_SUFFIX = "_error"
+METRIC_NAMES = (
+    "mae", "rmse", "r2", "mean_relative_error", "median_relative_error",
+)
+
+
+def _metrics(frame: pd.DataFrame, target: str) -> dict:
+    """Keep empty subsets explicit without passing them to sklearn metrics."""
+    if frame.empty:
+        return dict.fromkeys(METRIC_NAMES)
+    return regression_metrics(frame[target], frame[target + PREDICTED_SUFFIX])
+
+
+def _records(table: pd.DataFrame) -> list[dict]:
+    """Pandas may coerce undefined singleton-group metrics from None to NaN."""
+    return table.astype(object).where(pd.notna(table), None).to_dict("records")
 
 
 def prediction_frame(rows: pd.DataFrame, predictions, target_names) -> pd.DataFrame:
@@ -63,10 +79,10 @@ def breakdown(frame: pd.DataFrame, target: str, by, label: str | None = None) ->
     if label is None:
         label = by if isinstance(by, str) else getattr(by, "name", None) or "group"
     records = [
-        {label: key, "n": len(group), **regression_metrics(group[target], group[predicted])}
+        {label: key, "n": len(group), **_metrics(group, target)}
         for key, group in frame.groupby(by, observed=True, sort=True)
     ]
-    return pd.DataFrame.from_records(records)
+    return pd.DataFrame.from_records(records, columns=[label, "n", *METRIC_NAMES])
 
 
 def stall_regime(frame: pd.DataFrame, threshold: float = STALL_ALPHA) -> pd.Series:
@@ -119,11 +135,16 @@ def lift_to_drag(frame: pd.DataFrame, lift: str = "Cl", drag: str = "Cd") -> pd.
     return ratios
 
 
-def summarize(frame: pd.DataFrame, target_names, threshold: float = STALL_ALPHA) -> dict:
+def summarize(
+    frame: pd.DataFrame, target_names, threshold: float = STALL_ALPHA,
+    *, training_frame: pd.DataFrame | None = None,
+) -> dict:
     """Assemble every breakdown for a run report, as JSON-ready records.
 
-    ``reynolds`` groups on the eight discrete Reynolds numbers in the archive,
-    and ``lift_to_drag`` is reported once rather than per target.
+    Reynolds groups use observed values, never an assumed reference Reynolds
+    number. Optional domains use only training geometry descriptor ranges, not
+    evaluated target errors, and never remove rows from the pooled headline.
+    Row masks are positional boolean lists in evaluated-frame order.
     """
     target_names = list(target_names)
     regime = stall_regime(frame, threshold)
@@ -134,17 +155,131 @@ def summarize(frame: pd.DataFrame, target_names, threshold: float = STALL_ALPHA)
         "targets": {},
     }
     for target in target_names:
+        geometry_scores = per_geometry(frame, target)
+        concentration = geometry_scores[["geometry_id", "n", "rmse"]].copy()
+        concentration["sse"] = concentration["n"] * concentration["rmse"] ** 2
+        total_sse = float(concentration["sse"].sum())
+        concentration["sse_share"] = (
+            concentration["sse"] / total_sse if total_sse > 0 else 0.0
+        )
+        top = concentration.sort_values(
+            ["sse", "geometry_id"], ascending=[False, True],
+        ).head(10)
+        distributions = {}
+        for metric in ("mae", "rmse", "median_relative_error"):
+            values = geometry_scores[metric].dropna()
+            distributions[metric] = {
+                "n_defined": int(len(values)),
+                **{
+                    name: float(values.quantile(q)) if len(values) else None
+                    for name, q in (("p50", 0.5), ("p90", 0.9), ("p95", 0.95))
+                },
+            }
         report["targets"][target] = {
-            "overall": regression_metrics(frame[target], frame[target + PREDICTED_SUFFIX]),
-            "regime": breakdown(frame, target, regime, "regime").to_dict("records"),
-            "reynolds": breakdown(frame, target, "Re", "Re").to_dict("records"),
-            "worst_geometries": worst_geometries(frame, target).to_dict("records"),
+            "overall": _metrics(frame, target),
+            "regime": _records(breakdown(frame, target, regime, "regime")),
+            "reynolds": _records(breakdown(frame, target, "Re", "Re")),
+            "worst_geometries": _records(worst_geometries(frame, target)),
+            "error_concentration": {
+                "methodology": "Per-geometry SSE = n * rmse^2; top 10 ranked by SSE. "
+                "Shares divide by total evaluated SSE; all shares are zero when total SSE is zero.",
+                "total_sse": total_sse,
+                "top_10_sse_share": float(top["sse_share"].sum()),
+                "top_geometries": _records(top),
+            },
+            "per_geometry_distribution": {
+                "methodology": "Unweighted per-airfoil metric quantiles (linear interpolation); "
+                "undefined relative errors are excluded and counted via n_defined.",
+                "n_geometries": int(len(geometry_scores)),
+                "metrics": distributions,
+            },
+        }
+
+    missing = [name for name in ("Alpha", "Ncrit", "Re") if name not in frame]
+    easy_mask = (
+        (frame["Alpha"].abs() <= threshold) & (frame["Ncrit"] == 9)
+        if not missing else pd.Series(False, index=frame.index)
+    )
+    easy = frame.loc[easy_mask]
+    report["matched_easy_subset"] = {
+        "methodology": "Fixed pre-stall |Alpha| <= threshold and Ncrit = 9; "
+        "all observed Reynolds numbers scored separately, with no assumed Re = 1e6. "
+        "Missing required columns yield an explicit empty subset; no target-error selection.",
+        "criteria": {"max_abs_alpha_degrees": threshold, "Ncrit": 9},
+        "missing_columns": missing,
+        "row_mask": easy_mask.tolist(),
+        "n_rows": int(len(easy)),
+        "n_geometries": int(easy["geometry_id"].nunique()),
+        "targets": {
+            target: {
+                "overall": _metrics(easy, target),
+                "reynolds": [
+                    {"Re": re, "n": int(len(group)),
+                     "n_geometries": int(group["geometry_id"].nunique()),
+                     **_metrics(group, target)}
+                    for re, group in easy.groupby("Re", observed=True, sort=True)
+                ],
+            }
+            for target in target_names
+        },
+    }
+
+    if training_frame is not None:
+        training = training_frame.drop_duplicates("geometry_id")
+        descriptors = [name for name in DESCRIPTOR_NAMES if name in training and name in frame]
+        ranges = {}
+        for name in descriptors:
+            values = training[name].to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if len(values):
+                ranges[name] = {
+                    "min": float(values.min()), "max": float(values.max()),
+                    "n_geometries": int(len(values)),
+                }
+        geometries = []
+        for geometry in frame.drop_duplicates("geometry_id")[["geometry_id", *descriptors]].to_dict("records"):
+            violations, unavailable = [], []
+            for name, limits in ranges.items():
+                value = float(geometry[name]) if pd.notna(geometry[name]) else None
+                if value is None or not np.isfinite(value):
+                    unavailable.append(name)
+                elif value < limits["min"] or value > limits["max"]:
+                    violations.append({"descriptor": name, "value": value,
+                                       "min": limits["min"], "max": limits["max"]})
+            geometries.append({
+                "geometry_id": geometry["geometry_id"],
+                "domain": "outside-training-range" if violations else "within-training-range",
+                "violations": violations,
+                "unavailable_descriptors": unavailable,
+            })
+        domains = []
+        for domain in ("within-training-range", "outside-training-range"):
+            names = [record["geometry_id"] for record in geometries if record["domain"] == domain]
+            mask = frame["geometry_id"].isin(names)
+            subset = frame.loc[mask]
+            domains.append({
+                "domain": domain, "geometry_ids": names, "row_mask": mask.tolist(),
+                "n_rows": int(len(subset)), "n_geometries": int(len(names)),
+                "targets": {target: _metrics(subset, target) for target in target_names},
+            })
+        report["training_domain"] = {
+            "methodology": "Univariate scalar DESCRIPTOR_NAMES min/max ranges from training only, "
+            "deduplicated by geometry_id (first row); profile features, labels and flow are excluded. "
+            "Outside means at least one finite descriptor exceeds a range; within means no observed "
+            "violation, not uncertainty or a certified domain. Missing values/ranges provide no evidence. "
+            "All evaluated rows remain in pooled and domain metrics; no target-error thresholds.",
+            "available": bool(ranges),
+            "n_training_rows": int(len(training_frame)),
+            "n_training_geometries": int(len(training)),
+            "descriptor_ranges": ranges,
+            "geometries": geometries,
+            "domains": domains,
         }
     if {"Cl", "Cd"}.issubset(target_names):
         ratios = lift_to_drag(frame)
         report["lift_to_drag"] = {
             "n_rows": int(len(ratios)),
             "n_dropped_rows": int(len(frame) - len(ratios)),
-            **regression_metrics(ratios["lift_to_drag"], ratios["lift_to_drag" + PREDICTED_SUFFIX]),
+            **_metrics(ratios, "lift_to_drag"),
         }
     return report

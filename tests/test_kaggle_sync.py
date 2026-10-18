@@ -25,7 +25,7 @@ class FakeRunner:
         self.stdout = stdout
         self.error = error
 
-    def __call__(self, command, *, check, capture_output, text):
+    def __call__(self, command, *, check, capture_output, text, env):
         self.commands.append(command)
         if self.error is not None:
             raise self.error
@@ -101,7 +101,7 @@ def test_a_missing_cli_explains_how_to_install_it(processed):
 def test_pull_lands_each_run_in_its_own_directory(tmp_path):
     destination_root = tmp_path / "kaggle"
 
-    def runner(command, *, check, capture_output, text):
+    def runner(command, *, check, capture_output, text, env):
         target = tmp_path / command[command.index("-p") + 1]
         (target / "run.json").write_text("{}")
         return SimpleNamespace(stdout="", returncode=0)
@@ -135,7 +135,7 @@ def test_pull_rejects_unsafe_run_ids(tmp_path, run_id):
 
 
 def test_default_run_id_is_a_utc_timestamp(tmp_path):
-    def runner(command, *, check, capture_output, text):
+    def runner(command, *, check, capture_output, text, env):
         (tmp_path / command[command.index("-p") + 1] / "metrics.csv").write_text("a,b\n")
         return SimpleNamespace(stdout="", returncode=0)
 
@@ -161,13 +161,57 @@ def test_kernel_metadata_enables_internet_and_attaches_the_dataset(tmp_path):
     assert metadata["code_file"] == "v2_experiment_kaggle.ipynb"
     assert metadata["kernel_type"] == "notebook" and metadata["language"] == "python"
     assert metadata["enable_internet"] is True
-    # Every model in the queue is CPU scikit-learn.
-    assert metadata["enable_gpu"] is False and metadata["enable_tpu"] is False
+    assert metadata["enable_gpu"] is True and metadata["enable_tpu"] is False
     assert metadata["dataset_sources"] == ["me/airfoil-v2"]
     assert metadata["is_private"] is True
     assert len(metadata["title"]) >= 5
     # The notebook itself is uploaded alongside the metadata.
     assert (staging / "v2_experiment_kaggle.ipynb").is_file()
+
+
+def test_kernel_cpu_override_and_explicit_gpu_shape(tmp_path):
+    stage = stage_kernel("me/run", "me/data", tmp_path / "cpu", accelerator="cpu")
+    assert json.loads((stage / "kernel-metadata.json").read_text())["enable_gpu"] is False
+    stage = stage_kernel("me/run", "me/data", tmp_path / "gpu", machine_shape="NvidiaTeslaT4")
+    assert json.loads((stage / "kernel-metadata.json").read_text())["machine_shape"] == "NvidiaTeslaT4"
+    with pytest.raises(ValueError, match="requires the GPU"):
+        stage_kernel("me/run", "me/data", tmp_path / "bad", accelerator="cpu", machine_shape="NvidiaL4")
+
+
+def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
+    import ast
+    import base64
+    import hashlib
+    import io
+    import zipfile
+
+    first = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "gpu")
+    second = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "gpu")
+    assert first == second
+    syntax = ast.parse("".join(first["source"]))
+    assignments = {node.targets[0].id: node.value for node in syntax.body if isinstance(node, ast.Assign)}
+    payload = base64.b64decode(ast.literal_eval(assignments["_source_archive"].args[0]))
+    assert hashlib.sha256(payload).hexdigest() == ast.literal_eval(assignments["BUNDLED_SOURCE_SHA256"])
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        paths = archive.namelist()
+        assert "src/training/comparison.py" in paths
+        assert "configs/frozen_split.json" in paths
+        assert "requirements-kaggle.txt" in paths
+        assert all(path.startswith(("src/", "tests/", "configs/", "requirements", "pyproject")) for path in paths)
+        assert not any(path.startswith(("data/", "results/", ".")) for path in paths)
+
+
+def test_cli_token_file_workaround_does_not_expose_or_replace_credentials(monkeypatch):
+    seen = {}
+    def runner(command, **kwargs):
+        seen.update(kwargs["env"])
+        return SimpleNamespace(stdout="ready")
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
+    kaggle_sync.dataset_status("me/data", runner=runner)
+    assert seen["KAGGLE_API_TOKEN"] == ""
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "test-token")
+    kaggle_sync.dataset_status("me/data", runner=runner)
+    assert seen["KAGGLE_API_TOKEN"] == "test-token"
 
 
 def test_kernel_can_be_published_explicitly(tmp_path):

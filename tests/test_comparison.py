@@ -25,6 +25,14 @@ class OffsetRegressor:
         return np.asarray(x) + self.offsets
 
 
+class FixedRegressor:
+    def __init__(self, predictions):
+        self.predictions = np.asarray(predictions)
+
+    def predict(self, x):
+        return self.predictions[:len(x)]
+
+
 def read_json(path):
     def reject_constant(value):
         raise ValueError(f"Nonstandard JSON constant: {value}")
@@ -237,6 +245,77 @@ def test_default_queue_is_sequential_and_bounded():
         "hidden_layers": (64, 32), "max_iter": 100, "batch_size": 1024,
         "early_stopping": False, "random_state": 42,
     }
+
+
+def test_accuracy_queue_preserves_the_baseline_and_isolates_huber_loss():
+    configs = comparison.ACCURACY_MODEL_CONFIGS
+    assert configs[0] == comparison.DEFAULT_MODEL_CONFIGS[-1]
+    assert [entry["name"] for entry in configs] == ["mlp", "torch_mlp_mse", "torch_mlp_huber"]
+    mse, huber = [dict(entry["parameters"]) for entry in configs[1:]]
+    assert mse.pop("loss") == "mse"
+    assert huber.pop("loss") == "huber"
+    assert mse == huber and mse["device"] == "cuda"
+    assert all(not entry["scale_targets"] for entry in configs[1:])
+
+
+def test_torch_training_receives_only_transformed_validation_and_records_device(tmp_path, monkeypatch):
+    x = np.array([[1.0, -4.0, 0.2], [2.0, -3.0, 0.3]])
+    validation = x + [.5, -.5, .1]
+    y, y_validation = x.copy(), validation.copy()
+    y[:, 1], y_validation[:, 1] = np.exp(y[:, 1]), np.exp(y_validation[:, 1])
+    seen = {}
+    def trainer(name, x_train, fitting_targets, output_dir, **parameters):
+        seen.update(parameters)
+        assert x_train is x
+        np.testing.assert_allclose(fitting_targets, x)
+        model = OffsetRegressor([0, 0, 0])
+        model.training_metadata_ = {"device": "cuda", "best_epoch": 12}
+        joblib.dump(model, output_dir / f"{name}.joblib")
+        return model, .01
+    monkeypatch.setattr(comparison, "train_model", trainer)
+    output = tmp_path / "comparison"
+    comparison.compare_models(
+        x, y, validation, y_validation, ["Cl", "Cd", "Cm"], output,
+        [{"name": "torch_mlp_huber", "parameters": {}, "scale_targets": False}],
+        target_transforms={"Cd": "log"},
+    )
+    assert seen["target_names"] == ("Cl", "Cd", "Cm")
+    assert seen["validation_data"][0] is validation
+    np.testing.assert_allclose(seen["validation_data"][1], validation)
+    assert read_json(output / "run.json")["results"]["torch_mlp_huber"]["training_metadata"] == {
+        "device": "cuda", "best_epoch": 12,
+    }
+
+
+def test_drag_selection_can_prioritize_typical_relative_error_without_test_reranking(tmp_path, monkeypatch):
+    x = np.ones((10, 2))
+    predictions = {"linear": x + .1, "random_forest": x.copy()}
+    predictions["random_forest"][-1, 1] += 1.0
+    def trainer(name, x_train, y_train, output_dir, **parameters):
+        model = FixedRegressor(predictions[name])
+        joblib.dump(model, output_dir / f"{name}.joblib")
+        return model, .01
+    monkeypatch.setattr(comparison, "train_model", trainer)
+    output = tmp_path / "comparison"
+    comparison.compare_models(
+        x, x, x, x, ["Cl", "Cd"], output,
+        [{"name": name, "parameters": {}, "scale_targets": False} for name in predictions],
+        selection_metrics={"Cd": "median_relative_error"},
+    )
+    manifest = read_json(output / "run.json")
+    assert manifest["selection_metrics"] == {"Cl": "rmse", "Cd": "median_relative_error"}
+    assert manifest["selected_models"]["Cd"] == "random_forest"
+    comparison.evaluate_selected_models(output, x, predictions["linear"], ["Cl", "Cd"])
+    evaluated = read_json(output / "test_evaluation.json")
+    assert evaluated["selected_models"]["Cd"] == "random_forest"
+    assert evaluated["selection_metric"] == "validation_per_target"
+
+
+@pytest.mark.parametrize("metrics", [{"Unknown": "rmse"}, {"Cl": "r2"}])
+def test_invalid_selection_metrics_fail_before_creating_artifacts(tmp_path, metrics):
+    with pytest.raises(ValueError, match="Selection metrics|Select on"):
+        comparison.compare_models([[1]], [[2]], [[3]], [[4]], ["Cl"], tmp_path / "run", selection_metrics=metrics)
+    assert not (tmp_path / "run").exists()
 
 
 def test_sequential_checkpoints_warnings_failure_and_model_release(tmp_path, monkeypatch, capsys):

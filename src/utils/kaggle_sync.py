@@ -14,19 +14,25 @@ unless you ask for them.
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 
 from src.data.loaders import GEOMETRY_TABLE, LOAD_REPORT, POLARS_TABLE
 
 PUSH_FILES = (GEOMETRY_TABLE, POLARS_TABLE, LOAD_REPORT)
 DEFAULT_PROCESSED = Path(__file__).resolve().parents[2] / "data" / "processed"
 DEFAULT_RESULTS = Path(__file__).resolve().parents[2] / "results" / "kaggle"
+DEFAULT_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_NOTEBOOK = (
     Path(__file__).resolve().parents[2] / "notebooks" / "v2_experiment_kaggle.ipynb"
 )
@@ -49,7 +55,10 @@ def _title(reference: str, minimum: int) -> str:
 def _run(command: list[str], runner=subprocess.run) -> str:
     """Invoke the Kaggle CLI, turning its failures into actionable messages."""
     try:
-        completed = runner(command, check=True, capture_output=True, text=True)
+        environment = os.environ.copy()
+        # The CLI deletes this key even when authentication used its token file.
+        environment.setdefault("KAGGLE_API_TOKEN", "")
+        completed = runner(command, check=True, capture_output=True, text=True, env=environment)
     except FileNotFoundError as error:
         raise RuntimeError(
             "The kaggle CLI is not installed. Run `pip install kaggle`, then save an API "
@@ -118,26 +127,82 @@ def push_tables(
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _source_cell(source_root: Path, accelerator: str) -> dict:
+    """Embed an allowlisted source snapshot, never data, credentials, or weights."""
+    root = Path(source_root)
+    files = [*root.glob("src/**/*.py"), *root.glob("tests/**/*.py")]
+    files += [root / name for name in (
+        "configs/frozen_split.json", "configs/config.yaml", "requirements.txt",
+        "requirements-kaggle.txt", "pyproject.toml",
+    )]
+    if not (root / "src" / "training" / "comparison.py").is_file():
+        raise FileNotFoundError(f"Training source not found in {root}.")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(set(files)):
+            if path.is_file():
+                entry = zipfile.ZipInfo(path.relative_to(root).as_posix())
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(entry, path.read_bytes())
+    contents = buffer.getvalue()
+    digest = hashlib.sha256(contents).hexdigest()
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = "unknown"
+    code = (
+        "from pathlib import Path\n"
+        "import base64, hashlib, io, tempfile, zipfile\n"
+        f"KAGGLE_ACCELERATOR = {accelerator!r}\n"
+        f"BUNDLED_SOURCE_SHA256 = {digest!r}\n"
+        f"BUNDLED_GIT_REVISION = {revision!r}\n"
+        f"_source_archive = base64.b64decode({base64.b64encode(contents).decode('ascii')!r})\n"
+        "assert hashlib.sha256(_source_archive).hexdigest() == BUNDLED_SOURCE_SHA256\n"
+        "BUNDLED_SOURCE_DIR = Path(tempfile.mkdtemp(prefix='airfoil-source-'))\n"
+        "with zipfile.ZipFile(io.BytesIO(_source_archive)) as _archive:\n"
+        "    _archive.extractall(BUNDLED_SOURCE_DIR)\n"
+        "del _source_archive\n"
+        "print('Bundled source SHA256:', BUNDLED_SOURCE_SHA256)\n"
+    )
+    return {
+        "cell_type": "code", "id": "kaggle-source-bundle", "execution_count": None, "metadata": {},
+        "outputs": [], "source": code.splitlines(keepends=True),
+    }
+
+
 def stage_kernel(
     kernel: str,
     dataset: str,
     staging_dir: Path,
     notebook: Path = DEFAULT_NOTEBOOK,
     private: bool = True,
+    *,
+    accelerator: str = "gpu",
+    machine_shape: str | None = None,
+    source_root: Path = DEFAULT_SOURCE_ROOT,
 ) -> Path:
     """Write the notebook and its ``kernel-metadata.json`` into a clean folder.
 
-    Internet is enabled because the notebook clones the source checkout inside
-    the session, and the tables dataset is attached as its only input. No GPU:
-    every model in the queue is a CPU scikit-learn estimator.
+    GPU is requested by default. The source snapshot travels in the notebook,
+    so uncommitted improvements run without a GitHub push; its hash is recorded.
     """
     _reference(kernel, "kernel")
     _reference(dataset, "dataset")
+    if accelerator not in ("gpu", "cpu"):
+        raise ValueError("accelerator must be 'gpu' or 'cpu'.")
+    if machine_shape and accelerator != "gpu":
+        raise ValueError("machine_shape requires the GPU accelerator.")
     notebook, staging_dir = Path(notebook), Path(staging_dir)
     if not notebook.is_file():
         raise FileNotFoundError(f"Notebook not found: {notebook}")
     staging_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(notebook, staging_dir / notebook.name)
+    document = json.loads(notebook.read_text(encoding="utf-8"))
+    document["cells"].insert(0, _source_cell(source_root, accelerator))
+    (staging_dir / notebook.name).write_text(
+        json.dumps(document, indent=1) + "\n", encoding="utf-8",
+    )
     (staging_dir / "kernel-metadata.json").write_text(
         json.dumps(
             {
@@ -147,12 +212,13 @@ def stage_kernel(
                 "language": "python",
                 "kernel_type": "notebook",
                 "is_private": bool(private),
-                "enable_gpu": False,
+                "enable_gpu": accelerator == "gpu",
                 "enable_tpu": False,
                 "enable_internet": True,
                 "dataset_sources": [dataset],
                 "competition_sources": [],
                 "kernel_sources": [],
+                **({"machine_shape": machine_shape} if machine_shape else {}),
             },
             indent=2,
         )
@@ -174,6 +240,10 @@ def push_kernel(
     notebook: Path = DEFAULT_NOTEBOOK,
     private: bool = True,
     runner=subprocess.run,
+    *,
+    accelerator: str = "gpu",
+    machine_shape: str | None = None,
+    source_root: Path = DEFAULT_SOURCE_ROOT,
 ) -> str:
     """Upload the notebook and queue a run.
 
@@ -194,7 +264,10 @@ def push_kernel(
         )
     staging = Path(tempfile.mkdtemp(prefix="kaggle-kernel-"))
     try:
-        stage_kernel(kernel, dataset, staging, notebook, private)
+        stage_kernel(
+            kernel, dataset, staging, notebook, private, accelerator=accelerator,
+            machine_shape=machine_shape, source_root=source_root,
+        )
         return _run(["kaggle", "kernels", "push", "-p", str(staging)], runner)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -253,6 +326,10 @@ def main() -> None:
     kernel.add_argument("kernel", help="Kaggle kernel ref, e.g. yourname/airfoil-v2-experiment.")
     kernel.add_argument("--dataset", required=True, help="Tables dataset to attach as input.")
     kernel.add_argument("--notebook", type=Path, default=DEFAULT_NOTEBOOK)
+    kernel.add_argument("--accelerator", choices=("gpu", "cpu"), default="gpu")
+    kernel.add_argument(
+        "--machine-shape", help="Optional Kaggle GPU type, e.g. NvidiaTeslaT4 or NvidiaL4.",
+    )
     kernel.add_argument(
         "--public", action="store_true", help="Publish the notebook instead of keeping it private.",
     )
@@ -273,6 +350,7 @@ def main() -> None:
         elif args.command == "kernel":
             output = push_kernel(
                 args.kernel, args.dataset, args.notebook, private=not args.public,
+                accelerator=args.accelerator, machine_shape=args.machine_shape,
             )
             print(output.strip() or f"Pushed {args.notebook.name} to {args.kernel}.")
             print(f"Track it with: python -m src.utils.kaggle_sync status {args.kernel}")

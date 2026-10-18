@@ -52,6 +52,24 @@ DEFAULT_MODEL_CONFIGS = (
     },
 )
 
+# Keep the published 113-input baseline unchanged. The GPU pair differs only
+# in loss, isolating Huber from the shared physics/capacity/backend changes.
+ACCURACY_MODEL_CONFIGS = (
+    DEFAULT_MODEL_CONFIGS[-1],
+    *(
+        {
+            "name": f"torch_mlp_{loss}",
+            "parameters": {
+                "loss": loss, "hidden_layers": (128, 128, 64), "max_iter": 300,
+                "batch_size": 4096, "device": "cuda", "random_state": 42,
+                "target_weights": (1.0, 2.0, 0.5),
+            },
+            "scale_targets": False,
+        }
+        for loss in ("mse", "huber")
+    ),
+)
+
 SCORE_COLUMNS = ["mae", "rmse", "r2", "mean_relative_error", "median_relative_error"]
 METRIC_COLUMNS = [
     "model", "target", *SCORE_COLUMNS,
@@ -151,7 +169,7 @@ def load_frozen_split(
             "polar_rows": int(len(polars)),
         },
         "baseline_run": str(baseline_run_path),
-        "baseline_git_commit": baseline.get("git_commit"),
+        "baseline_git_commit": baseline.get("git_commit") or baseline.get("source_git_commit"),
         # v1's row counts are recorded for comparison, not enforced: the v2
         # loader filters non-numeric polars that v1 let through.
         "baseline_split_rows": baseline.get("split_rows") or baseline.get("v1_split_rows"),
@@ -171,8 +189,9 @@ def load_frozen_split(
 def compare_models(
     x_train, y_train, x_validation, y_validation, target_names, output_dir,
     model_configs=None, run_metadata=None, target_transforms=None,
+    selection_metrics=None,
 ):
-    """Fit one model at a time and select each target's lowest validation RMSE.
+    """Fit sequentially and select by explicit per-target validation metrics.
 
     Only training and validation data enter this API. Model failures are recorded
     and do not stop later fits; interrupts propagate with prior checkpoints intact.
@@ -184,6 +203,12 @@ def compare_models(
     nothing to fit the targets exactly as given.
     """
     target_names = _names(target_names, "target_names")
+    selection_metrics = {} if selection_metrics is None else dict(selection_metrics)
+    if set(selection_metrics).difference(target_names):
+        raise ValueError("Selection metrics must name targets in this experiment.")
+    metrics = {target: selection_metrics.get(target, "rmse") for target in target_names}
+    if not all(metric in ("rmse", "mae", "median_relative_error") for metric in metrics.values()):
+        raise ValueError("Select on rmse, mae, or median_relative_error (lower is better).")
     _validate_targets(x_train, y_train, target_names)
     _validate_targets(x_validation, y_validation, target_names)
     transforms = transform_names(target_names, target_transforms)
@@ -195,6 +220,11 @@ def compare_models(
         fitting_targets = forward_targets(y_train, target_names, target_transforms)
         if len(target_names) == 1:
             fitting_targets = fitting_targets[:, 0]
+    fitting_validation = y_validation
+    if transformed:
+        fitting_validation = forward_targets(y_validation, target_names, target_transforms)
+        if len(target_names) == 1:
+            fitting_validation = fitting_validation[:, 0]
 
     configs = list(DEFAULT_MODEL_CONFIGS if model_configs is None else model_configs)
     names = set()
@@ -209,8 +239,10 @@ def compare_models(
         names.add(name)
         if not isinstance(config["parameters"], dict) or type(config["scale_targets"]) is not bool:
             raise ValueError("Model parameters must be a dict and scale_targets must be a bool.")
-        if {"name", "x_train", "y_train", "output_dir", "scale_targets"}.intersection(config["parameters"]):
+        if {"name", "x_train", "y_train", "output_dir", "scale_targets", "validation_data", "target_names"}.intersection(config["parameters"]):
             raise ValueError("Model parameters must not override training inputs or artifact settings.")
+        if name.startswith("torch_mlp_") and config["scale_targets"]:
+            raise ValueError("Torch MLP requires scale_targets=False.")
 
     manifest = {
         "run_metadata": {} if run_metadata is None else run_metadata,
@@ -218,7 +250,8 @@ def compare_models(
         "target_transforms": transforms,
         "model_configs": configs,
         "status": "running",
-        "selection_metric": "validation_rmse",
+        "selection_metric": "validation_rmse" if set(metrics.values()) == {"rmse"} else "validation_per_target",
+        "selection_metrics": metrics,
         "selected_models": {},
         "results": {
             config["name"]: {
@@ -233,7 +266,7 @@ def compare_models(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
     rows = []
-    best_rmse = {}
+    best_scores = {}
 
     def checkpoint():
         table = pd.DataFrame(rows, columns=COMPARISON_COLUMNS)
@@ -259,9 +292,15 @@ def compare_models(
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
+                training_parameters = dict(config["parameters"])
+                if name.startswith("torch_mlp_"):
+                    training_parameters.update(
+                        target_names=tuple(target_names),
+                        validation_data=(x_validation, fitting_validation),
+                    )
                 model, elapsed = train_model(
                     name, x_train, fitting_targets, output_dir=model_dir,
-                    scale_targets=config["scale_targets"], **config["parameters"],
+                    scale_targets=config["scale_targets"], **training_parameters,
                 )
                 scored = (
                     PhysicalPredictor(model, target_names, target_transforms)
@@ -275,7 +314,20 @@ def compare_models(
                 "n_predictions": evaluation["n_predictions"],
                 "model_path": f"{name}/{name}.joblib",
             }
+            fitted = getattr(model, "regressor_", model)
+            if hasattr(fitted, "named_steps"):
+                fitted = fitted.named_steps["model"]
+            if hasattr(fitted, "training_metadata_"):
+                success["training_metadata"] = fitted.training_metadata_
+            elif hasattr(fitted, "n_iter_"):
+                success["training_metadata"] = {
+                    "n_iter": int(fitted.n_iter_), "max_iter": int(fitted.max_iter),
+                    "tol": float(fitted.tol), "n_iter_no_change": int(fitted.n_iter_no_change),
+                }
             json.dumps(success, allow_nan=False)
+            for target in target_names:
+                if evaluation["targets"][target][metrics[target]] is None:
+                    raise ValueError(f"Validation {metrics[target]} is undefined for {target}.")
             result.update(success)
             for target in target_names:
                 scores = evaluation["targets"][target]
@@ -285,8 +337,9 @@ def compare_models(
                     "batch_inference_time_seconds": result["batch_inference_time_seconds"],
                     "n_predictions": result["n_predictions"],
                 })
-                if target not in best_rmse or scores["rmse"] < best_rmse[target]:
-                    best_rmse[target] = scores["rmse"]
+                value = scores[metrics[target]]
+                if target not in best_scores or value < best_scores[target]:
+                    best_scores[target] = value
                     manifest["selected_models"][target] = name
         except Exception as error:
             # Store text, not the exception/traceback, so failed fits can be freed.
@@ -297,7 +350,7 @@ def compare_models(
             ]
             # The scoring wrapper holds the model too, so both must go before
             # the next fit allocates.
-            del model, scored
+            model = scored = fitted = None
             gc.collect()
         _write_json(model_dir / "result.json", result)
         checkpoint()
@@ -365,7 +418,8 @@ def evaluate_selected_models(comparison_dir, x_test, y_test, target_names):
     records = [rows[target] for target in target_names]
     table = pd.DataFrame(records, columns=METRIC_COLUMNS)
     _write_json(output / "test_evaluation.json", {
-        "selection_metric": "validation_rmse", "selected_models": selected,
+        "selection_metric": manifest["selection_metric"], "selected_models": selected,
+        "selection_metrics": manifest.get("selection_metrics", {target: "rmse" for target in target_names}),
         "target_names": target_names, "target_transforms": transforms, "results": records,
     })
     table.to_csv(output / "test_metrics.csv", index=False)

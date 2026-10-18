@@ -20,7 +20,17 @@ from src.models.polynomial import build_model as build_polynomial
 from src.models.random_forest import build_model as build_rf
 
 
-MODEL_BUILDERS = {"linear": build_linear, "polynomial": build_polynomial, "random_forest": build_rf, "gradient_boosting": build_gb, "mlp": build_mlp}
+def build_torch_mlp(**kwargs):
+    # CPU workflows and portable prediction artifacts do not require PyTorch.
+    from src.models.torch_mlp import build_model
+    return build_model(**kwargs)
+
+
+MODEL_BUILDERS = {
+    "linear": build_linear, "polynomial": build_polynomial, "random_forest": build_rf,
+    "gradient_boosting": build_gb, "mlp": build_mlp,
+    "torch_mlp_mse": build_torch_mlp, "torch_mlp_huber": build_torch_mlp,
+}
 
 
 def train_model(
@@ -30,19 +40,25 @@ def train_model(
     output_dir: str | Path = "results/models",
     *,
     scale_targets: bool = False,
+    validation_data=None,
     **kwargs,
 ) -> tuple[object, float]:
     """Fit and save a model, optionally standardizing training targets only."""
     if name not in MODEL_BUILDERS:
         raise ValueError(f"Unknown model {name!r}; choose from {sorted(MODEL_BUILDERS)}")
     model = MODEL_BUILDERS[name](**kwargs)
+    if name.startswith("torch_mlp_") and scale_targets:
+        raise ValueError("Torch MLP normalizes its own targets; use scale_targets=False.")
     if scale_targets:
         model = TransformedTargetRegressor(regressor=model, transformer=StandardScaler())
     if name == "gradient_boosting" and np.ndim(y_train) == 2:
         # Each target wrapper sees 1D y, including when the input has just one column.
         model = MultiOutputRegressor(model)
     started = time.perf_counter()
-    model.fit(x_train, y_train)
+    if name.startswith("torch_mlp_"):
+        model.fit(x_train, y_train, validation_data=validation_data)
+    else:
+        model.fit(x_train, y_train)
     elapsed = time.perf_counter() - started
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
