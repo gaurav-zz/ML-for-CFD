@@ -197,8 +197,37 @@ def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
         assert "src/training/comparison.py" in paths
         assert "configs/frozen_split.json" in paths
         assert "requirements-kaggle.txt" in paths
-        assert all(path.startswith(("src/", "tests/", "configs/", "requirements", "pyproject")) for path in paths)
+        assert "notebooks/v2_experiment_kaggle.ipynb" in paths
+        assert all(path.startswith(("src/", "tests/", "configs/", "notebooks/", "requirements", "pyproject")) for path in paths)
         assert not any(path.startswith(("data/", "results/", ".")) for path in paths)
+
+
+def test_extracted_bundle_supports_notebook_and_kernel_checks_without_git(tmp_path):
+    import ast
+    import base64
+    import io
+    import os
+    import sys
+    import zipfile
+
+    cell = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "cpu")
+    syntax = ast.parse("".join(cell["source"]))
+    assignment = next(node for node in syntax.body if isinstance(node, ast.Assign)
+                      and node.targets[0].id == "_source_archive")
+    payload = base64.b64decode(ast.literal_eval(assignment.value.args[0]))
+    extracted = tmp_path / "unpacked"
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        archive.extractall(extracted)
+    assert not (extracted / ".git").exists()
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_kaggle_sync.py",
+         "tests/test_kaggle_notebook.py", "-k",
+         "kernel_metadata_enables_internet or kernel_staging_defaults or every_code_cell_compiles"],
+        cwd=extracted, env={**os.environ, "PYTHONPATH": str(extracted)},
+        capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "3 passed" in completed.stdout
 
 
 def test_cli_token_file_workaround_does_not_expose_or_replace_credentials(monkeypatch):

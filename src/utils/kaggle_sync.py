@@ -134,6 +134,7 @@ def _source_cell(source_root: Path, accelerator: str) -> dict:
     files += [root / name for name in (
         "configs/frozen_split.json", "configs/config.yaml", "requirements.txt",
         "requirements-kaggle.txt", "pyproject.toml",
+        "notebooks/v2_experiment_kaggle.ipynb",
     )]
     if not (root / "src" / "training" / "comparison.py").is_file():
         raise FileNotFoundError(f"Training source not found in {root}.")
