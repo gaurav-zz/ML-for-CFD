@@ -186,12 +186,14 @@ def test_accuracy_queue_is_copied_and_selects_drag_by_validation_median(cells, a
     }
     exec(compile(cells["v2-queue"], "kaggle:queue", "exec"), namespace)
     configs = namespace["MODEL_CONFIGS"]
-    expected = list(ACCURACY_MODEL_CONFIGS) if accelerator == "gpu" else [ACCURACY_MODEL_CONFIGS[0]]
+    expected = deepcopy(list(ACCURACY_MODEL_CONFIGS))
+    if accelerator == "cpu":
+        for entry in expected[1:]:
+            entry["parameters"]["device"] = "cpu"
     assert list(configs) == expected
     assert configs is not ACCURACY_MODEL_CONFIGS
-    assert [config["name"] for config in configs] == (
-        ["mlp", "torch_mlp_mse", "torch_mlp_huber"] if accelerator == "gpu" else ["mlp"]
-    )
+    assert [config["name"] for config in configs] == ["mlp", "torch_mlp_mse", "torch_mlp_huber"]
+    assert all(entry["parameters"]["device"] == ("cuda" if accelerator == "gpu" else "cpu") for entry in configs[1:])
     assert all(config["scale_targets"] is False for config in configs[1:])
     configs[0]["parameters"]["max_iter"] = -1
     assert ACCURACY_MODEL_CONFIGS[0]["parameters"]["max_iter"] != -1
@@ -231,7 +233,10 @@ def test_gpu_preflight_is_kaggle_only_and_precedes_experiment(cells, monkeypatch
     namespace["ACCELERATOR"] = "cpu"
     exec(compile(cells["kaggle-gpu-tests"], "kaggle:gpu-tests", "exec"), namespace)
     assert namespace["GPU_TESTS_PASSED"] is False
-    assert len(commands) == 1
+    assert namespace["CPU_TESTS_PASSED"] is True
+    assert len(commands) == 2
+    assert commands[1][1]["env"]["KAGGLE_CPU_TESTS"] == "1"
+    assert commands[1][1]["env"]["KAGGLE_GPU_TESTS"] == "0"
 
 
 def test_training_uses_only_train_validation_and_records_provenance(cells):

@@ -1,3 +1,3 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
-markers = ["gpu: optional Kaggle-only CUDA fitting"]
+markers = ["gpu: optional Kaggle-only CUDA fitting", "cloud_fit: optional Kaggle-only CPU fitting"]

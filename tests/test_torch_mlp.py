@@ -235,6 +235,35 @@ KAGGLE_GPU_ONLY = pytest.mark.skipif(
 )
 
 
+@pytest.mark.cloud_fit
+@pytest.mark.skipif(
+    os.environ.get("KAGGLE_CPU_TESTS") != "1" or not Path("/kaggle/working").is_dir(),
+    reason="CPU fitting is permitted only on Kaggle; opt in with KAGGLE_CPU_TESTS=1.",
+)
+@pytest.mark.parametrize("loss", ["mse", "huber"])
+def test_kaggle_cpu_fitting_and_portable_predictions(loss, tmp_path):
+    pytest.importorskip("torch")
+    train, targets, val, val_targets = _gpu_data()
+    model = build_model(hidden_layers=(8,), max_iter=3, batch_size=32, patience=10,
+                        device="cpu", loss=loss)
+    model.fit(train, targets, validation_data=(val, val_targets))
+    assert model.training_metadata_["accelerator"] == "cpu"
+    assert model.training_metadata_["restored_best_checkpoint"] is True
+    assert model.n_iter_ == 3
+    prediction = model.predict(val)
+    np.testing.assert_allclose(model.predict(_reflect(val)), prediction * model.target_signs_, atol=1e-6)
+    error = np.abs((prediction - val_targets) / model.target_scaler_.scale_)
+    elementwise = error ** 2 if loss == "mse" else np.where(
+        error <= model.huber_delta, 0.5 * error ** 2,
+        model.huber_delta * (error - 0.5 * model.huber_delta),
+    )
+    measured = np.average(elementwise, weights=model.target_weights, axis=1).mean()
+    np.testing.assert_allclose(measured, model.best_loss_, rtol=2e-5, atol=2e-6)
+    path = tmp_path / "cpu.joblib"
+    joblib.dump(model, path)
+    np.testing.assert_array_equal(joblib.load(path).predict(val), prediction)
+
+
 @pytest.fixture
 def kaggle_cuda():
     torch = pytest.importorskip("torch")

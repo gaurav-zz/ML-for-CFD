@@ -263,8 +263,10 @@ This generates `kernel-metadata.json`: **GPU on by default**, internet on for Ka
 dependencies, the tables dataset attached, and a private notebook unless `--public` is
 passed. Optional `--machine-shape NvidiaTeslaT4` requests T4 hardware explicitly; otherwise
 Kaggle chooses the GPU. The notebook checks CUDA and records the actual device. It never
-silently trains GPU candidates on CPU. `--accelerator cpu` explicitly runs the baseline
-only. `requirements-kaggle.txt` is installed on Kaggle, not locally.
+silently trains GPU candidates on CPU. `--accelerator cpu` explicitly runs the same
+accuracy candidates on Kaggle CPU after cloud-only CPU fitting tests. It can be used
+when GPU allocation is queued, but training will be slower. `requirements-kaggle.txt`
+is installed on Kaggle, not locally.
 
 Equivalently, in the browser: **Add Input → Datasets** → attach the dataset,
 **Settings → Internet: On**, select an available **GPU accelerator**, then
