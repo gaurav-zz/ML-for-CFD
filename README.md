@@ -13,6 +13,12 @@ evaluation protocol are prerequisites; accuracy improvements still require measu
 
 ## Status
 
+**Latest:** the 12-fit controlled study completed on 19 October 2026. Huber improves
+median error across all three seeds, but drag extrapolation is unstable. The
+validation-selected no-weight-decay trial is **not an overall accuracy upgrade**:
+its slightly better median conceals substantially worse RMSE. Defaults and the
+pinned CPU reference have not been changed.
+
 The completed Kaggle CPU run (`20261018T115938507650Z`) and automatic-GPU run
 (`20261018T121854085520Z`) both selected **Torch Huber** on validation for all three
 targets. Test results use the same **123 unseen airfoils / 116,484 operating points**:
@@ -44,6 +50,82 @@ absolute error, R², and tail diagnostics alongside it.
 do not require PyTorch. The completed CPU/GPU runs share seed 42; matching devices is
 not a multi-seed study. The test set has been inspected diagnostically, so new folds
 or new airfoils remain necessary for stronger confirmation.
+
+### Completed controlled study
+
+Run `20261019T115249707139Z`, from source `96bf0bc`, completed **12/12 fits** on a
+Tesla T4 in about **33.4 minutes**, including preflight and evaluation. Cloud
+preflight passed **469 tests**, with four skips and one deselected test. All fits
+stopped on validation patience, restored their best checkpoints, and recorded their
+device, seed, epoch count and hyperparameters. Training remained on Kaggle.
+
+**Three paired seeds (42, 43, 44):** mean test median-relative error plus/minus sample
+standard deviation, in percent. These are three-seed descriptive statistics, not
+confidence intervals or geometry-fold uncertainty.
+
+| target | Torch MSE | Torch Huber | mean reduction |
+|---|---|---|---|
+| `Cl` | 4.782 +/- 0.125% | **3.834 +/- 0.017%** | 0.948 pp |
+| `Cd` | 6.633 +/- 0.061% | **5.612 +/- 0.065%** | 1.021 pp |
+| `Cm` | 11.316 +/- 0.507% | **10.124 +/- 0.451%** | 1.192 pp |
+
+Huber improved each target's median in every paired seed. However, its drag tail
+performance is not seed-stable on the **same test rows**:
+
+| Huber seed | test Cd median error | test Cd RMSE | test Cd R² |
+|---|---|---|---|
+| 42 | 5.574% | 0.01157 | 0.8760 |
+| 43 | 5.575% | 0.01553 | 0.7766 |
+| 44 | 5.687% | 0.04159 | **-0.6021** |
+
+Saved-weight diagnostics attribute **96.08% of seed 44's drag squared error** to
+FX 79-W-660A. This is genuine extrapolation instability, not a change of test-set
+variance or evidence that a good pooled median protects every airfoil. No seed
+was selected using its test performance.
+
+**Seed-42 sweep, selected only on validation drag median error:**
+
+| Huber delta | weight decay | validation Cd median error |
+|---|---|---|
+| 0.05 | 1e-5 (reference) | 5.898% |
+| 0.02 | 1e-5 | 6.345% |
+| 0.10 | 1e-5 | 5.846% |
+| **0.05** | **0** | **5.660% (selected)** |
+| 0.05 | 1e-4 | 7.762% |
+
+Only the selected sweep alternative was evaluated on test, after the choice was
+frozen. It produced median errors Cl **3.915%**, Cd **5.542%**, Cm **9.569%**. Against
+the pinned CPU Huber reference, those changes are **+0.102, -0.031, -0.081 pp**,
+respectively, so the requested 0.5-pp median guard **passes**.
+
+That pass is limited: selected-model Cd RMSE rises from **0.01154 to 0.01935**, and
+R² falls from **0.8766 to 0.6531**. FX 79-W-660A accounts for **81.87%** of its drag
+squared error. Post-stall R² improves to 0.7691, while pre-stall R² is only 0.5023
+and Re=50,000 R² is 0.0718. The 0.031-pp test-median improvement is smaller than the
+observed three-seed variation of the reference. The median-only CI policy does not
+guard these tails; it must not be interpreted as proof of overall improvement.
+
+**Torch airfoil-exposure diagnostic:** both arms used 347,877 training rows, the
+same 54,917 audit rows, and a common 80,612-row stopping set. The exposed arm replaced
+54,974 training rows with other operating points from 114 audit airfoils. Actual
+audit rows never entered training, and canonical validation/test rows were unused.
+
+| audit median error | unseen-airfoil arm | exposed-airfoil arm |
+|---|---|---|
+| `Cl` | 4.277% | 3.238% |
+| `Cd` | 5.938% | 4.154% |
+| `Cm` | 10.151% | 7.745% |
+
+Drag R² rises from 0.9350 to 0.9568 on identical audit rows/SST. Exposure makes the
+audit easier: drag median error improves by **1.784 pp**, about 30%. This supports
+geometry-disjoint evaluation for unseen-airfoil claims. It is not a production
+gain, a universal leakage-effect estimate, or proof that geometry IDs are memorized.
+
+Artifacts: `results/kaggle/controlled-study-v2/experiments/v2/20261019T115249707139Z/`.
+The source archive SHA256 is
+`e2512826802de6e7dfbfaa61221cb53a1cb471819225ebe10b01b18e44eb5fc5`.
+`study_selection.json` preserves the validation choice, and the seed summaries,
+paired deltas, leakage scores and selected-model diagnostics remain separate files.
 
 ### Remaining drag error
 
@@ -78,15 +160,19 @@ measurements of physical stall or separation.
 | `|Alpha| <= 12`, `Ncrit=9`, all Re | 45,555 | 123 | 6.21% | 9.78% |
 | same conditions, fixed `Re=1e6` | 9,360 | 123 | **6.44%** | **11.17%** |
 
+The selected no-weight-decay trial scores **6.33% median / 11.51% mean** on that
+same fixed-Re subset: the median improves slightly, but the mean worsens.
+
 Re=1e6 was fixed in advance, not selected for the lowest test error. NeuralFoil's
 0.37% is a **mean**, not a median, and its data, case split and averaging differ.
 Matching these conditions improves reporting but does not make the experiments
 directly equivalent. The geometry correction provides validity and interpretability;
 the measured MLP gain must not be attributed to that correction alone.
 
-These diagnostics were recomputed with saved NumPy weights, without fitting or
-Torch. A local sklearn scaler-version warning was emitted; pooled drag metrics
-agree with the original cloud report within 6e-8. Reproduce into a new output file:
+The CPU-reference diagnostics were recomputed with saved NumPy weights, without
+fitting or Torch. A local sklearn scaler-version warning was emitted; its pooled
+drag metrics agree with the original CPU cloud report within 6e-8. Reproduce into
+a new output file:
 
 ```bash
 python -m src.training.analysis <completed-run-dir> --output <completed-run-dir>/diagnostics.json
@@ -242,10 +328,11 @@ installing PyTorch locally.
 Full quadratic expansion is deliberately excluded from the queue: ~113 inputs expand to
 thousands of features, tens of gigabytes for one float64 training matrix at 538k rows.
 
-The completed v2 benchmark held hyperparameters fixed. The new accuracy experiment
-changes physics features, architecture, optimizer, and stopping together versus that
-baseline; only the MSE/Huber pair isolates a single intervention. It is a single-seed
-comparison, not evidence of seed-robust improvements.
+The completed v2 benchmark held hyperparameters fixed. The initial accuracy experiment
+changed physics features, architecture, optimizer, and stopping together versus that
+baseline; only the MSE/Huber pair isolates a single intervention. The subsequent
+three-seed study supports the median-error benefit of Huber, but also exposes drag
+tail instability. It does not isolate the geometry correction from the other changes.
 
 Every neural result records `training_metadata` in its trial `run.json`: `device`,
 `device_name`, seed, `n_iter`, `max_iter`, `best_epoch`, stop reason, and restored-best
@@ -410,6 +497,8 @@ python -m src.utils.accuracy_guard --candidate-dir <completed-run-dir> --toleran
 
 The existing automatic-GPU run passes: relative to CPU, median-error changes are
 Cl **+0.000605 pp**, Cd **+0.000699 pp**, Cm **+0.001285 pp**.
+The completed sweep winner also passes, despite the RMSE regression documented
+above. This guard covers typical relative error only; tail checks remain necessary.
 
 `.github/workflows/accuracy.yml` runs fit-free checks on push/PR. Its manual
 `workflow_dispatch` accuracy job downloads a **completed** trusted Kaggle comparison
@@ -420,6 +509,18 @@ This does **not** train on GitHub or pretend unit tests measure a refactor's new
 accuracy: a completed Kaggle candidate and dispatch are required for that check.
 Study test trials also emit standard reports. Use the `selected_trial` recorded in
 `study_selection.json` for the sweep candidate, not whichever test trial looks best.
+
+### Progress report
+
+`Minor_Project_Progress_Report.docx` contains the latest results and three embedded
+plots in **three total pages**, including the student details and references. The
+page count and layout were checked by rendering with LibreOffice 26.8.1; the PDF
+proof is in `results/kaggle/controlled-study-v2/report-render/`.
+
+The original report is preserved in
+`results/kaggle/controlled-study-v2/report-backup.docx`; the separate `docs/` copy
+is unchanged. The one-off generation tools and temporary renderer were removed
+after validation; opening the final DOCX requires no additional project dependencies.
 
 ## Repository Structure
 
@@ -450,15 +551,18 @@ tests/                              Unit tests
 
 ## Limitations and Next Steps
 
-- The completed Huber gains above are single-seed observations, not yet seed-robust
-  estimates. Neither a small validation delta nor matched CPU/GPU output establishes that.
+- Three seeds support Huber's typical-error gain, but its drag RMSE/R² vary severely
+  on the same test set. Address out-of-range geometry and low-Re tails before claiming
+  a generally reliable surrogate; do not hide them by removing test airfoils.
 - `Cdp`, `Cp_ps`/`Cp_ss` (100-point pressure distributions), and the `alpha_min`/`max`/
   `step` fields are present in the archive and unused.
 - The leading-edge radius is fitted from the vertical thickness distribution, so for a
   strongly cambered section it runs above the radius measured normal to the camber line.
   It remains a monotonic, physical feature; it is not a certified nose radius.
-- Geometry-fold evaluation, multi-seed uncertainty, additional extreme geometries, and
-  XFOIL panel-resolution label-noise checks remain future work. The frozen test was
+- More seeds for the sweep winner, geometry-fold evaluation, additional extreme
+  geometries, and XFOIL panel-resolution label-noise checks remain future work. A
+  longer-patience study and explicitly specified tail-regression thresholds have not
+  been run or adopted. The frozen test was
   inspected for diagnosis; new folds or new airfoils are needed for stronger confirmation.
 
 ## Citation
