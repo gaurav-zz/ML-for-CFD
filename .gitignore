@@ -31,3 +31,6 @@ results/models/*
 .ipynb_checkpoints/
 .DS_Store
 HANDOFF.md
+
+# Personal report: keep every copy local, including the docs/ template.
+Minor_Project_Progress_Report.docx

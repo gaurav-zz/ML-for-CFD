@@ -516,6 +516,7 @@ Study test trials also emit standard reports. Use the `selected_trial` recorded 
 plots in **three total pages**, including the student details and references. The
 page count and layout were checked by rendering with LibreOffice 26.8.1; the PDF
 proof is in `results/kaggle/controlled-study-v2/report-render/`.
+The personal report is kept locally and ignored by Git to prevent future commits.
 
 The original report is preserved in
 `results/kaggle/controlled-study-v2/report-backup.docx`; the separate `docs/` copy
