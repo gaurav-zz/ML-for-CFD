@@ -255,6 +255,33 @@ def test_observed_signed_peaks_censoring_sparse_and_cd_regions():
     json.dumps(report, allow_nan=False)
 
 
+def test_numpy_group_keys_serialize_across_pandas_versions(monkeypatch):
+    rows = pd.DataFrame({
+        "geometry_id": "foil", "Alpha": [10, 13, 15, 17, 20],
+        "Re": 1000000, "Ncrit": 9, "Cl": [.5, 1, 2, 1, .5], "Cd": .1,
+    })
+    original_groupby = pd.DataFrame.groupby
+
+    def numpy_groupby(frame, by, *args, **kwargs):
+        groups = original_groupby(frame, by, *args, **kwargs)
+        if isinstance(by, list) and by == ["geometry_id", "Re", "Ncrit", "sign"]:
+            return (((key[0], np.int64(key[1]), np.int64(key[2]), np.str_(key[3])), group)
+                    for key, group in groups)
+        if isinstance(by, str) and by == "Re":
+            return ((np.int64(key), group) for key, group in groups)
+        return groups
+
+    # pandas 2 (Kaggle) can retain NumPy group scalars even when local pandas
+    # converts them to Python scalars. Reproduce that independently of version.
+    monkeypatch.setattr(pd.DataFrame, "groupby", numpy_groupby)
+    report = summarize(prediction_frame(rows, rows[["Cl", "Cd"]], ["Cl", "Cd"]), ["Cl", "Cd"])
+    restored = json.loads(json.dumps(report, allow_nan=False))
+    curve = restored["observed_cl_peak"]["curves"][0]
+    assert type(curve["Re"]) is int and type(curve["Ncrit"]) is int
+    assert curve["Re"] == 1000000 and curve["Ncrit"] == 9
+    assert curve["sign"] == "positive"
+
+
 def test_peak_keys_zero_missing_and_duplicate_angles_do_not_invent_curves():
     rows = pd.DataFrame({
         "geometry_id": ["a"] * 11, "Alpha": [0, 1, 1, 2, 3, 4, 5, 5, np.nan, 1, 2],

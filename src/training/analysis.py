@@ -207,7 +207,8 @@ def poststall_alpha(frame: pd.DataFrame, target: str) -> dict:
                                 ("positive", post.loc[post["Alpha"] > 0]))
         ],
         "reynolds": [
-            {"Re": re, **_diagnostic_subset(group, target, overall["sse"])}
+            {"Re": re.item() if isinstance(re, np.generic) else re,
+             **_diagnostic_subset(group, target, overall["sse"])}
             for re, group in post.groupby("Re", observed=True, sort=True)
         ] if "Re" in post else [],
     }
@@ -242,6 +243,8 @@ def observed_cl_peak(frame: pd.DataFrame, *, min_angles: int = 5) -> dict:
         curves["magnitude"] = curves["Alpha"].abs()
         curves["signed_cl"] = np.where(curves["Alpha"] < 0, -curves["Cl"], curves["Cl"])
         for key, group in curves.groupby([*keys, "sign"], observed=True, sort=True):
+            # pandas versions differ in whether group keys retain NumPy types.
+            key = tuple(value.item() if isinstance(value, np.generic) else value for value in key)
             # Duplicate angles do not make a sparse curve dense; exact ties use
             # the innermost observed angle and expose all tied peak positions.
             angles = group.groupby("magnitude", sort=True)["signed_cl"].max()
@@ -372,7 +375,7 @@ def summarize(
             target: {
                 "overall": _metrics(easy, target),
                 "reynolds": [
-                    {"Re": re, "n": int(len(group)),
+                    {"Re": re.item() if isinstance(re, np.generic) else re, "n": int(len(group)),
                      "n_geometries": int(group["geometry_id"].nunique()),
                      **_metrics(group, target)}
                     for re, group in easy.groupby("Re", observed=True, sort=True)
