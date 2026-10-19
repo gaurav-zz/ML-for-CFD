@@ -67,7 +67,11 @@ def _run(command: list[str], runner=subprocess.run) -> str:
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or "").strip()
         raise RuntimeError(f"`{' '.join(command)}` failed: {detail}") from error
-    return completed.stdout or ""
+    output = completed.stdout or ""
+    # Some Kaggle CLI releases print API rejections but still exit with code 0.
+    if "kernel push error:" in output.lower():
+        raise RuntimeError(output.strip())
+    return output
 
 
 def stage_dataset(dataset: str, staging_dir: Path, processed_dir: Path = DEFAULT_PROCESSED) -> Path:
@@ -127,10 +131,12 @@ def push_tables(
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _source_cell(source_root: Path, accelerator: str) -> dict:
+def _source_cell(source_root: Path, accelerator: str, machine_shape: str | None = None) -> dict:
     """Embed an allowlisted source snapshot, never data, credentials, or weights."""
     root = Path(source_root)
     files = [*root.glob("src/**/*.py"), *root.glob("tests/**/*.py")]
+    files += [*root.glob("configs/accuracy_baseline/*.json"),
+              *root.glob("configs/accuracy_baseline/*.csv")]
     files += [root / name for name in (
         "configs/frozen_split.json", "configs/config.yaml", "requirements.txt",
         "requirements-kaggle.txt", "pyproject.toml",
@@ -157,6 +163,7 @@ def _source_cell(source_root: Path, accelerator: str) -> dict:
         "from pathlib import Path\n"
         "import base64, hashlib, io, tempfile, zipfile\n"
         f"KAGGLE_ACCELERATOR = {accelerator!r}\n"
+        f"KAGGLE_MACHINE_SHAPE = {machine_shape!r}\n"
         f"BUNDLED_SOURCE_SHA256 = {digest!r}\n"
         f"BUNDLED_GIT_REVISION = {revision!r}\n"
         f"_source_archive = base64.b64decode({base64.b64encode(contents).decode('ascii')!r})\n"
@@ -183,6 +190,7 @@ def stage_kernel(
     accelerator: str = "gpu",
     machine_shape: str | None = None,
     source_root: Path = DEFAULT_SOURCE_ROOT,
+    study: bool = False,
 ) -> Path:
     """Write the notebook and its ``kernel-metadata.json`` into a clean folder.
 
@@ -200,7 +208,28 @@ def stage_kernel(
         raise FileNotFoundError(f"Notebook not found: {notebook}")
     staging_dir.mkdir(parents=True, exist_ok=True)
     document = json.loads(notebook.read_text(encoding="utf-8"))
-    document["cells"].insert(0, _source_cell(source_root, accelerator))
+    if study:
+        # Reuse bootstrap/preflight/data loading, but let the study orchestrator
+        # freeze all choices before evaluation. Never run the ordinary test cells.
+        train_index = next((i for i, cell in enumerate(document["cells"])
+                            if cell.get("id") == "v2-train"), None)
+        if train_index is None:
+            raise ValueError("Study mode requires the v2-train notebook cell.")
+        cell = document["cells"][train_index]
+        source = "".join(cell["source"])
+        marker = "validation_results = compare_models("
+        if marker not in source:
+            raise ValueError("Study mode could not locate the standard training entry point.")
+        source = source.split(marker, 1)[0] + (
+            "from src.training.study import run_study\n"
+            "run_study(split, feature_columns, target_columns, RUN_OUTPUT,\n"
+            "          run_metadata=run_metadata,\n"
+            "          device='cuda' if ACCELERATOR == 'gpu' else 'cpu')\n"
+            "print(f'Controlled study artifacts: {RUN_OUTPUT}')\n"
+        )
+        cell["source"] = source.splitlines(keepends=True)
+        document["cells"] = document["cells"][:train_index + 1]
+    document["cells"].insert(0, _source_cell(source_root, accelerator, machine_shape))
     (staging_dir / notebook.name).write_text(
         json.dumps(document, indent=1) + "\n", encoding="utf-8",
     )
@@ -245,6 +274,7 @@ def push_kernel(
     accelerator: str = "gpu",
     machine_shape: str | None = None,
     source_root: Path = DEFAULT_SOURCE_ROOT,
+    study: bool = False,
 ) -> str:
     """Upload the notebook and queue a run.
 
@@ -268,6 +298,7 @@ def push_kernel(
         stage_kernel(
             kernel, dataset, staging, notebook, private, accelerator=accelerator,
             machine_shape=machine_shape, source_root=source_root,
+            study=study,
         )
         return _run(["kaggle", "kernels", "push", "-p", str(staging)], runner)
     finally:
@@ -328,6 +359,7 @@ def main() -> None:
     kernel.add_argument("--dataset", required=True, help="Tables dataset to attach as input.")
     kernel.add_argument("--notebook", type=Path, default=DEFAULT_NOTEBOOK)
     kernel.add_argument("--accelerator", choices=("gpu", "cpu"), default="gpu")
+    kernel.add_argument("--study", action="store_true", help="Run the controlled seed, loss-sweep, and leakage study.")
     kernel.add_argument(
         "--machine-shape", help="Optional Kaggle GPU type, e.g. NvidiaTeslaT4 or NvidiaL4.",
     )
@@ -352,6 +384,7 @@ def main() -> None:
             output = push_kernel(
                 args.kernel, args.dataset, args.notebook, private=not args.public,
                 accelerator=args.accelerator, machine_shape=args.machine_shape,
+                study=args.study,
             )
             print(output.strip() or f"Pushed {args.notebook.name} to {args.kernel}.")
             print(f"Track it with: python -m src.utils.kaggle_sync status {args.kernel}")

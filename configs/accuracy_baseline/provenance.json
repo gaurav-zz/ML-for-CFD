@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "description": "Completed Kaggle CPU v2 run; validation selected torch_mlp_huber for Cl, Cd and Cm. No new fit was used to create this pin.",
+  "source_directory": "results/kaggle/cpu-v2/experiments/v2/20261018T115938507650Z",
+  "source_run_sha256": "ca707a25508b069ad09f0bfc5ac99e85a524ced0400d0a33eb0e0aa45cf72628",
+  "files_sha256": {
+    "run.json": "178db93bd3ba2c5a4b6c24c8d86ccfe19ec73245c6e09a00150692f69042f76b",
+    "test_evaluation.json": "4ec7ba283ae8981de5c8196659d0c1095dedba7b6c69f65a9ad8abc08ba3cbc3",
+    "test_metrics.csv": "4b0d59ded8e222b049de3551ece1853e07207e91aa8002e99fe7c29a0ed8f207"
+  },
+  "projection": {
+    "test_metrics.csv": "Exact byte copy of all original test records, including other metrics, timing, selected model and prediction counts.",
+    "test_evaluation.json": "Exact byte copy.",
+    "run.json": "Original values, compact formatting; only run_metadata.feature_columns and results.*.training_metadata.history omitted. All dataset fingerprints, full split membership lists, targets/transforms, row counts, statuses, model configurations, validation metrics and remaining hardware/stopping provenance retained. history_truncated describes the source history, not this projection."
+  },
+  "guard_policy": {
+    "metric": "median_relative_error",
+    "metric_unit": "fraction",
+    "evaluation_partition": "test",
+    "default_tolerance_pp": 0.5,
+    "failure_rule": "(candidate - baseline) * 100 > tolerance_pp for any target",
+    "improvements_allowed": true,
+    "selected_model_may_change": true,
+    "dataset_and_splits_must_match": true,
+    "limitations": "Report validation cannot prove a producer did not inspect test data. Original reports attest validation selection and stopping but contain no explicit test_used_for_tuning declaration. This pin is a single run, not a seed-variance confidence interval. PR unit tests exercise the guard; a completed source-pinned Kaggle candidate is required for an actual regression check."
+  }
+}

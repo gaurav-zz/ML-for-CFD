@@ -8,30 +8,89 @@ Can machine-learning models learn the relationship between airfoil geometry, flo
 conditions, and aerodynamic coefficients accurately enough to act as a fast surrogate for
 conventional aerodynamic analysis — **on airfoils they have never seen**?
 
-That last clause is the whole claim, and it is why the geometry representation described
-below matters more than the choice of model.
+That last clause is the generalization claim. Valid geometry and a geometry-disjoint
+evaluation protocol are prerequisites; accuracy improvements still require measurement.
 
 ## Status
 
-The completed Kaggle v2 run (`20261013T115819972797Z`) selected the MLP for all three
-targets. On the frozen test partition of **123 unseen airfoils**, its results are:
+The completed Kaggle CPU run (`20261018T115938507650Z`) and automatic-GPU run
+(`20261018T121854085520Z`) both selected **Torch Huber** on validation for all three
+targets. Test results use the same **123 unseen airfoils / 116,484 operating points**:
 
-| target | median relative error | RMSE | R² |
-|---|---|---|---|
-| `Cl` | 5.96% | 0.13051 | 0.9709 |
-| `Cd` | 8.11% | 0.01973 | 0.6393 |
-| `Cm` | 12.28% | 0.02182 | 0.8213 |
+| target | original MLP median relative error | CPU Huber median | GPU Huber median | CPU Huber RMSE | CPU Huber R² |
+|---|---|---|---|---|---|
+| `Cl` | 5.96% | **3.81%** | 3.81% | 0.08688 | 0.9871 |
+| `Cd` | 8.11% | **5.57%** | 5.57% | 0.01154 | 0.8766 |
+| `Cm` | 12.28% | **9.65%** | 9.65% | 0.01297 | 0.9369 |
 
-Drag validation R² was 0.9224, not the test result. The 66%-thick FX 79-W-660A,
-outside the training thickness range, contributes **80.9% of test drag squared error**.
-The `|Alpha| > 12°` subset has drag R² = -0.173 and median relative error = 9.99%.
-These tail failures must not be hidden by the pooled median or attributed to every
-post-stall prediction equally.
+Drag median error decreased by **2.54 percentage points**, about 31% relative to the
+original MLP. On validation, the controlled GPU MSE/Huber pair gives **6.83% / 5.90%**
+median drag error. This supports a loss-specific improvement in that experiment;
+the larger baseline-to-Huber change also includes architecture, optimizer, features,
+symmetry, and stopping changes. It is **not an isolated geometry-fix gain**.
 
-The next accuracy experiment compares that unchanged baseline with GPU-capable,
-literature-inspired neural models. **Training and accuracy comparisons run only on
-Kaggle through the API.** Local checks do not require a PyTorch installation. New
-accuracy gains remain unclaimed until the experiment completes.
+The GPU runtime reported **Tesla T4**, PyTorch 2.11.0+cu128, CUDA 12.8, and two visible
+GPUs; training used one CUDA device, not distributed training. GPU Huber fitted in
+184.6 seconds, stopped after **214 epochs**, and restored **epoch 184**. The CPU Huber
+run used the same stopping and best-epoch counts. GPU cloud preflight passed **325
+tests** (two CPU-only cases skipped); inference is portable NumPy on CPU.
+
+The original MLP had validation drag R² 0.9224 versus test 0.6393 while median error
+stayed near 8.1%. Its 66%-thick FX 79-W-660A extrapolation case contributed 80.9% of
+test drag squared error. This is why median relative error is the headline, with
+absolute error, R², and tail diagnostics alongside it.
+
+**All training runs on Kaggle through the API.** Local checks and saved-model analysis
+do not require PyTorch. The completed CPU/GPU runs share seed 42; matching devices is
+not a multi-seed study. The test set has been inspected diagnostically, so new folds
+or new airfoils remain necessary for stronger confirmation.
+
+### Remaining drag error
+
+CPU Huber's post-stall angle proxy (`|Alpha| > 12`) has **Cd R² = 0.7138**. A more
+detailed breakdown locates the remaining error:
+
+| absolute Alpha | rows | airfoils | Cd RMSE | Cd R² | share of post-stall squared error |
+|---|---|---|---|---|---|
+| `(12,16]` | 14,960 | 115 | 0.01537 | 0.7659 | 45.39% |
+| `(16,20]` | 5,566 | 103 | 0.02748 | 0.3735 | 53.98% |
+| `>20` | 63 | 1 | 0.02806 | -0.7096 | 0.64% |
+
+FX 79-W-660A contributes **68.71%** of the 16-20 degree bin's squared error and E863
+another **11.30%**. Negative-alpha rows contribute **60.99%** of total post-stall
+squared error. Only one airfoil has observations above 20 degrees; this cannot
+establish general fully-separated-flow accuracy.
+
+Using observed signed-lift maxima separately by airfoil/Re/Ncrit/angle sign, 2,076
+half-polars have interior peaks, 376 are boundary-censored, and 11 are too sparse.
+Among interior curves, post-stall Cd RMSE is **0.01088 within +/-2 degrees of the
+peak**, versus **0.02529 farther beyond it**. Farther-post-peak rows account for
+42.24% of post-stall squared error; boundary-censored curves account for another
+35.89%. The evidence points beyond an onset-only explanation, toward post-peak
+and difficult-geometry tails. Observed maxima and angle bins are diagnostics, not
+measurements of physical stall or separation.
+
+### Condition-matched reference
+
+| CPU Huber test subset | rows | airfoils | Cd median relative error | Cd mean relative error |
+|---|---|---|---|---|
+| pooled | 116,484 | 123 | 5.57% | 9.02% |
+| `|Alpha| <= 12`, `Ncrit=9`, all Re | 45,555 | 123 | 6.21% | 9.78% |
+| same conditions, fixed `Re=1e6` | 9,360 | 123 | **6.44%** | **11.17%** |
+
+Re=1e6 was fixed in advance, not selected for the lowest test error. NeuralFoil's
+0.37% is a **mean**, not a median, and its data, case split and averaging differ.
+Matching these conditions improves reporting but does not make the experiments
+directly equivalent. The geometry correction provides validity and interpretability;
+the measured MLP gain must not be attributed to that correction alone.
+
+These diagnostics were recomputed with saved NumPy weights, without fitting or
+Torch. A local sklearn scaler-version warning was emitted; pooled drag metrics
+agree with the original cloud report within 6e-8. Reproduce into a new output file:
+
+```bash
+python -m src.training.analysis <completed-run-dir> --output <completed-run-dir>/diagnostics.json
+```
 
 ## The v1 geometry caveat
 
@@ -188,6 +247,13 @@ changes physics features, architecture, optimizer, and stopping together versus 
 baseline; only the MSE/Huber pair isolates a single intervention. It is a single-seed
 comparison, not evidence of seed-robust improvements.
 
+Every neural result records `training_metadata` in its trial `run.json`: `device`,
+`device_name`, seed, `n_iter`, `max_iter`, `best_epoch`, stop reason, and restored-best
+checkpoint status. Run-level `machine_shape` is the requested API shape (`null` means
+automatic), not evidence of allocation; `gpu.device_name` records actual hardware.
+Run-level `inference_device` is `cpu-numpy`. Selecting a GPU never changes the frozen
+split or moves reported inference onto CUDA.
+
 ## v1 baseline, for reference only
 
 Validation scores on the geometry-disjoint split (train 572 / validation 123 / test 123
@@ -252,7 +318,8 @@ weights are excluded. A SHA256 of the exact source archive is recorded in `run.j
 alongside the base Git revision. Browser-only execution retains the Git clone fallback.
 
 Everything else is CLI-able. Pushing a kernel is what *starts* a run; there is no separate
-run verb, and pushing an existing slug replaces that notebook and runs it again:
+run verb. Pushing an existing slug creates another version and **does not cancel an
+older queued or running version**. Check existing jobs first to avoid duplicate GPU slots:
 
 ```bash
 python -m src.utils.kaggle_sync kernel <owner>/<kernel-slug> --dataset <owner>/<dataset-slug>
@@ -261,8 +328,9 @@ python -m src.utils.kaggle_sync status <owner>/<kernel-slug>
 
 This generates `kernel-metadata.json`: **GPU on by default**, internet on for Kaggle-only
 dependencies, the tables dataset attached, and a private notebook unless `--public` is
-passed. Optional `--machine-shape NvidiaTeslaT4` requests T4 hardware explicitly; otherwise
-Kaggle chooses the GPU. The notebook checks CUDA and records the actual device. It never
+passed. Optional `--machine-shape NvidiaTeslaT4` records a requested T4 shape; older
+Kaggle CLI versions can ignore this metadata field. With no shape, Kaggle chooses the
+GPU. The notebook checks CUDA and records the actual device separately from the request. It never
 silently trains GPU candidates on CPU. `--accelerator cpu` explicitly runs the same
 accuracy candidates on Kaggle CPU after cloud-only CPU fitting tests. It can be used
 when GPU allocation is queued, but training will be slower. `requirements-kaggle.txt`
@@ -287,10 +355,35 @@ python -m src.utils.kaggle_sync pull <owner>/<kernel-slug>
 
 Each pull lands in its own `results/kaggle/<run-id>/` and never overwrites an existing run.
 
+### Controlled study
+
+```bash
+python -m src.utils.kaggle_sync kernel <owner>/<study-slug> --dataset <owner>/<dataset-slug> --accelerator gpu --study
+```
+
+Use one fresh study slug. The API reuses the tested notebook bootstrap and then hands
+off to the cloud-only study runner, without executing the ordinary test-report cells.
+The design is declared before fitting:
+
+- Seeds 42, 43, 44 with paired MSE/Huber models and the same frozen geometry split.
+  Report every seed and sample mean/standard deviation, never the best test seed.
+- Huber deltas 0.02, 0.05, 0.1 at weight decay 1e-5, and weight decays 0, 1e-5,
+  1e-4 at delta 0.05. This is a one-factor-at-a-time, seed-42 sweep, not a full grid.
+  Reuse the central seed-42 Huber fit; select by validation median drag error.
+- A separately labeled Torch leakage diagnostic, constructed only from canonical
+  training airfoils. Both arms share fixed audit rows and a common disjoint stopping
+  set. The exposed arm replaces training rows with other operating points from audit
+  airfoils, preserving row count and excluding the actual audit observations.
+
+Production choices are frozen before canonical test evaluation. The intentionally
+exposed arm never influences production selection. A three-seed study measures
+initialization variability on this split; it does not replace new geometry folds.
+
 ### Testing
 
 ```bash
 python -m pytest tests/test_kaggle_sync.py tests/test_kaggle_notebook.py tests/test_analysis.py tests/test_torch_mlp.py -m 'not gpu'
+python -m pytest tests/test_accuracy_guard.py tests/test_study.py
 ```
 
 The full suite, including model fitting, runs in the Kaggle notebook preflight. The
@@ -302,6 +395,31 @@ invariance to rotation/scale/translation/point order), descriptors against analy
 geometry, the two-table loader, feature assembly and leakage guards, the target-transform
 round trip, the new metrics, the frozen-split guards, the Kaggle transfer tool, and an
 end-to-end run of the Kaggle notebook against synthetic tables.
+
+### Accuracy regression guard
+
+`configs/accuracy_baseline/` pins the CPU Huber test CSV and matching provenance.
+The guard rejects inconsistent or incomplete reports, different data fingerprints,
+different geometry splits, missing targets/counts, and unrecorded hardware/stopping.
+It fails if **any target degrades by more than 0.5 percentage points** in median
+relative error (`0.005` in the stored fractions). Improvements are allowed.
+
+```bash
+python -m src.utils.accuracy_guard --candidate-dir <completed-run-dir> --tolerance-pp 0.5
+```
+
+The existing automatic-GPU run passes: relative to CPU, median-error changes are
+Cl **+0.000605 pp**, Cd **+0.000699 pp**, Cm **+0.001285 pp**.
+
+`.github/workflows/accuracy.yml` runs fit-free checks on push/PR. Its manual
+`workflow_dispatch` accuracy job downloads a **completed** trusted Kaggle comparison
+and requires its kernel, exact run ID, expected source-bundle SHA256, and source
+commit (defaults to the workflow commit). Configure `KAGGLE_API_TOKEN` as a repository
+secret. It retains exact reports and a receipt; downloaded code/weights are not run.
+This does **not** train on GitHub or pretend unit tests measure a refactor's new model
+accuracy: a completed Kaggle candidate and dispatch are required for that check.
+Study test trials also emit standard reports. Use the `selected_trial` recorded in
+`study_selection.json` for the sweep candidate, not whichever test trial looks best.
 
 ## Repository Structure
 
@@ -332,8 +450,8 @@ tests/                              Unit tests
 
 ## Limitations and Next Steps
 
-- New GPU accuracy gains have not yet been measured. The completed v2 test result is
-  reported above, including its extrapolation failure.
+- The completed Huber gains above are single-seed observations, not yet seed-robust
+  estimates. Neither a small validation delta nor matched CPU/GPU output establishes that.
 - `Cdp`, `Cp_ps`/`Cp_ss` (100-point pressure distributions), and the `alpha_min`/`max`/
   `step` fields are present in the archive and unused.
 - The leading-edge radius is fitted from the vertical thickness distribution, so for a

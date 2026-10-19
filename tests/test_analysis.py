@@ -8,7 +8,9 @@ from src.training.analysis import (
     STALL_ALPHA,
     breakdown,
     lift_to_drag,
+    observed_cl_peak,
     per_geometry,
+    poststall_alpha,
     prediction_frame,
     stall_regime,
     summarize,
@@ -146,7 +148,7 @@ def test_summary_is_json_ready_and_covers_every_requested_breakdown(scored):
         entry = report["targets"][target]
         assert set(entry) == {
             "overall", "regime", "reynolds", "worst_geometries",
-            "error_concentration", "per_geometry_distribution",
+            "error_concentration", "per_geometry_distribution", "poststall_alpha",
         }
         assert {record["regime"] for record in entry["regime"]} == {"pre-stall", "post-stall"}
         assert len(entry["reynolds"]) == 2
@@ -155,6 +157,239 @@ def test_summary_is_json_ready_and_covers_every_requested_breakdown(scored):
     assert report["lift_to_drag"]["n_dropped_rows"] == 0
     # run.json is written with allow_nan=False.
     json.dumps(report, allow_nan=False)
+
+
+def test_fixed_poststall_bands_boundaries_counts_and_sse_shares():
+    rows = pd.DataFrame({
+        "geometry_id": ["a"] * 5 + ["b"] * 5,
+        "Alpha": [12, 12.1, 16, 16.1, 20, -12, -16, -20, -20.1, 24],
+        "Re": [1e6] * 5 + [2e5] * 5, "Cd": np.arange(1, 11, dtype=float),
+    })
+    scored = prediction_frame(rows, rows["Cd"] + np.arange(1, 11), ["Cd"])
+    report = poststall_alpha(scored, "Cd")
+    first, second, third = report["bands"]
+    assert [band["band"] for band in report["bands"]] == ["(12,16]", "(16,20]", ">20"]
+    assert [band["n_rows"] for band in report["bands"]] == [3, 3, 2]
+    assert [band["n_geometries"] for band in report["bands"]] == [2, 2, 1]
+    assert report["overall"]["n_rows"] == 8
+    assert report["overall"]["sse"] == pytest.approx(348)
+    for band, sse in zip((first, second, third), (62, 105, 181)):
+        assert band["sse"] == pytest.approx(sse)
+        assert band["sse_share_of_poststall"] == pytest.approx(sse / 348)
+        assert band["metrics"]["mean_relative_error"] == pytest.approx(1)
+        assert band["n_scored_rows"] == band["n_rows"]
+        assert band["error_concentration"]["top_10_sse_share"] == pytest.approx(1)
+    assert first["error_concentration"]["top_geometries"][0]["geometry_id"] == "b"
+    assert sum(band["sse_share_of_poststall"] for band in report["bands"]) == pytest.approx(1)
+    assert [item["n_rows"] for item in report["signed_alpha"]] == [3, 5]
+    assert [item["Re"] for item in report["reynolds"]] == [2e5, 1e6]
+    # The new bands do not move when a legacy summary threshold is changed.
+    assert summarize(scored, ["Cd"], threshold=20)["targets"]["Cd"]["poststall_alpha"] == report
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_poststall_empty_zero_and_missing_pairs_are_finite(empty):
+    rows = pd.DataFrame({"geometry_id": ["a", "b"], "Alpha": [14, 22], "Re": [1e6] * 2, "Cd": [0, 0]})
+    scored = prediction_frame(rows, [0, 0], ["Cd"])
+    if empty:
+        scored = scored.iloc[:0]
+    report = poststall_alpha(scored, "Cd")
+    assert all(band["sse_share_of_poststall"] == 0 for band in report["bands"])
+    assert all(band["metrics"]["mean_relative_error"] is None for band in report["bands"])
+    if not empty:
+        scored.loc[0, "Cd_predicted"] = np.nan
+        report = poststall_alpha(scored, "Cd")
+        assert report["overall"]["n_scored_rows"] == 1
+        assert report["overall"]["n_unscored_rows"] == 1
+    json.dumps(report, allow_nan=False)
+
+
+def test_observed_signed_peaks_censoring_sparse_and_cd_regions():
+    frames = []
+    for geometry, sign, cl in (
+        ("interior", 1, [0.5, 1, 2, 1.5, 1]),
+        ("interior", -1, [0.5, 1, 2, 1.5, 1]),
+        ("upper", 1, [0.5, 1, 1.5, 2, 3]),
+        ("lower", 1, [3, 2, 1.5, 1, 0.5]),
+        ("tied", 1, [1, 2, 3, 2, 3]),
+        ("sparse", 1, [1, 2]),
+    ):
+        frames.append(pd.DataFrame({
+            "geometry_id": geometry, "Re": 1e6, "Ncrit": 9,
+            "Alpha": sign * np.array([10, 13, 15, 17, 20][:len(cl)]),
+            "Cl": sign * np.array(cl), "Cd": .1,
+        }))
+    rows = pd.concat(frames, ignore_index=True)
+    # Repeated input index labels must not merge unrelated curve positions.
+    rows.index = [0] * len(rows)
+    scored = prediction_frame(rows, rows["Cd"] + .01, ["Cd"])
+    original = scored.copy(deep=True)
+    report = observed_cl_peak(scored)
+    assert report["n_curves"] == 6
+    assert report["state_counts"] == {
+        "interior": {"n_curves": 2, "n_rows": 10},
+        "boundary-censored": {"n_curves": 3, "n_rows": 15},
+        "sparse": {"n_curves": 1, "n_rows": 2},
+    }
+    curves = {(record["geometry_id"], record["sign"]): record for record in report["curves"]}
+    negative = curves[("interior", "negative")]
+    assert negative["peak_alpha"] == -15
+    assert negative["max_signed_cl"] == 2
+    assert negative["peak_boundary"] is None
+    assert curves[("upper", "positive")]["peak_boundary"] == "upper"
+    assert curves[("lower", "positive")]["peak_boundary"] == "lower"
+    tied = curves[("tied", "positive")]
+    assert tied["peak_alpha"] == 15
+    assert tied["n_tied_peak_angles"] == 2
+    assert tied["peak_boundary"] == "upper"
+    interior = report["cd_comparisons"][0]
+    assert [region["n_rows"] for region in interior["regions"]] == [2, 6, 2]
+    assert [region["poststall"]["n_rows"] for region in interior["regions"]] == [0, 6, 2]
+    assert interior["regions"][1]["metrics"]["mean_relative_error"] == pytest.approx(.1)
+    # Predictions must not determine the observed-peak state or location.
+    changed = scored.copy()
+    changed["Cd_predicted"] = 999
+    assert observed_cl_peak(changed)["curves"] == report["curves"]
+    pd.testing.assert_frame_equal(scored, original)
+    json.dumps(report, allow_nan=False)
+
+
+def test_peak_keys_zero_missing_and_duplicate_angles_do_not_invent_curves():
+    rows = pd.DataFrame({
+        "geometry_id": ["a"] * 11, "Alpha": [0, 1, 1, 2, 3, 4, 5, 5, np.nan, 1, 2],
+        "Re": [1e6] * 9 + [2e5] * 2, "Ncrit": [9] * 7 + [5] * 4,
+        "Cl": [0, 1, 1, 1, 1, 1, 1, 2, 3, 1, 2], "Cd": [0.0] * 11,
+    })
+    scored = prediction_frame(rows, rows["Cd"], ["Cd"])
+    report = observed_cl_peak(scored)
+    assert report["n_zero_alpha_rows"] == report["n_missing_or_nonfinite_rows"] == 1
+    assert report["n_curves"] == 3
+    assert report["state_counts"]["sparse"] == {"n_curves": 2, "n_rows": 3}
+    dense = [record for record in report["curves"] if record["n_angles"] == 5][0]
+    assert dense["n_rows"] == 6
+    assert dense["peak_boundary"] == "both"
+    assert dense["state"] == "boundary-censored"
+    for frame in (scored, scored.iloc[:0], scored.drop(columns=["Cl"]), scored.drop(columns=["Ncrit"])):
+        json.dumps(observed_cl_peak(frame), allow_nan=False)
+    assert observed_cl_peak(scored.drop(columns=["Cl"]))["missing_columns"] == ["Cl"]
+    with pytest.raises(ValueError, match="at least 3"):
+        observed_cl_peak(scored, min_angles=2)
+
+
+def test_easy_reference_is_fixed_re_not_the_best_test_re():
+    rows = pd.DataFrame({
+        "geometry_id": ["a", "a", "b", "c", "c", "d"],
+        "Alpha": [12, -12, 3, 2, 13, 2], "Re": [1e6, 1e6, 2e5, 1e6, 1e6, 1e6],
+        "Ncrit": [9, 9, 9, 5, 9, 9], "Cd": [1, 2, 3, 4, 5, 0],
+    }, index=[1, 1, 0, 0, 1, 1])
+    scored = prediction_frame(rows, [2, 2, 3, 4, 5, 0], ["Cd"])
+    report = summarize(scored, ["Cd"])
+    easy = report["matched_easy_subset"]
+    reference = easy["fixed_re_reference"]
+    assert easy["n_rows"] == 4
+    assert reference["criteria"] == {"max_abs_alpha_degrees": 12, "Ncrit": 9, "Re": 1e6}
+    assert reference["row_mask"] == [True, True, False, False, False, True]
+    assert reference["n_rows"] == 3
+    assert reference["n_geometries"] == 2
+    assert reference["targets"]["Cd"]["mean_relative_error"] == pytest.approx(.5)
+    selected = summarize(scored, ["Cd"], reference_re=2e5)["matched_easy_subset"]["fixed_re_reference"]
+    assert selected["n_rows"] == selected["n_geometries"] == 1
+    assert selected["targets"]["Cd"]["r2"] is None
+    assert selected["targets"]["Cd"]["mae"] == 0
+    absent = summarize(scored, ["Cd"], reference_re=5e6)["matched_easy_subset"]["fixed_re_reference"]
+    assert absent["n_rows"] == 0
+    assert all(value is None for value in absent["targets"]["Cd"].values())
+    missing = summarize(scored.drop(columns=["Re"]), ["Cd"])
+    assert missing["matched_easy_subset"]["missing_columns"] == ["Re"]
+    assert missing["matched_easy_subset"]["fixed_re_reference"]["n_rows"] == 0
+    for value in (report, selected, absent, missing):
+        json.dumps(value, allow_nan=False)
+    with pytest.raises(ValueError, match="finite and positive"):
+        summarize(scored, ["Cd"], reference_re=np.inf)
+
+
+def test_analysis_cli_only_predicts_frozen_named_test_rows_without_torch(tmp_path, monkeypatch):
+    import builtins
+    import hashlib
+
+    import joblib
+
+    from src.data.features import feature_names
+    from src.models.torch_mlp import TorchMLPRegressor
+    from src.training.analysis import main
+
+    geometry = pd.DataFrame({"geometry_id": ["train", "validation", "test"], "max_thickness": [.1, .2, .3]})
+    polars = pd.DataFrame({
+        "geometry_id": ["train", "validation"] + ["test"] * 5,
+        "Alpha": [1, 1, 10, 13, 15, 17, 20], "Re": [1e6] * 7, "Ncrit": [9] * 7,
+        "Cl": [1, 1, .5, 1, 2, 1, .5], "Cd": [.1] * 7,
+    })
+    dataset = {}
+    for name, table in (("geometry", geometry), ("polars", polars)):
+        path = tmp_path / (name + ".csv")
+        table.to_csv(path, index=False)
+        dataset.update({name + "_table": path.name, name + "_rows": len(table),
+                        name + "_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    dataset["polar_rows"] = dataset.pop("polars_rows")
+    split = {name: [name] for name in ("train", "validation", "test")}
+    frozen = tmp_path / "frozen.json"
+    frozen.write_text(json.dumps({"split_geometries": split}))
+    targets = ["Cd", "Cl"]
+    manifest = {
+        "status": "completed", "target_names": targets,
+        "selected_models": dict.fromkeys(targets, "torch_mlp_huber"),
+        "target_transforms": {"Cd": "log", "Cl": "identity"},
+        "run_metadata": {"dataset": dataset, "split_geometries": split, "split_rows": {"test": 5},
+                         "feature_columns": feature_names(geometry, polars)},
+        "results": {"torch_mlp_huber": {"status": "success", "model_path": "weights.joblib"}},
+    }
+    (tmp_path / "run.json").write_text(json.dumps(manifest))
+    predictor = TorchMLPRegressor(target_names=tuple(targets))
+    predictions = []
+
+    def predict(self, features):
+        assert self is predictor
+        assert list(features.columns) == manifest["run_metadata"]["feature_columns"]
+        assert features["max_thickness"].tolist() == [.3] * 5
+        predictions.append(features["Alpha"].tolist())
+        return np.tile([np.log(.2), 1.0], (len(features), 1))
+
+    def no_fit(*args, **kwargs):
+        pytest.fail("The analysis CLI must never fit a model.")
+
+    original_import = builtins.__import__
+
+    def no_torch(name, *args, **kwargs):
+        assert name.split(".")[0] != "torch", "Analysis must not import Torch."
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_torch)
+    monkeypatch.setattr(TorchMLPRegressor, "fit", no_fit)
+    monkeypatch.setattr(TorchMLPRegressor, "predict", predict)
+    monkeypatch.setattr(joblib, "load", lambda path: predictor)
+    output = tmp_path / "diagnostics.json"
+    args = [str(tmp_path), "--data-dir", str(tmp_path), "--frozen-split", str(frozen), "--output", str(output)]
+    main(args)
+    report = json.loads(output.read_text())
+    assert predictions == [[10, 13, 15, 17, 20]]
+    assert report["n_rows"] == 5
+    assert report["targets"]["Cd"]["overall"]["mae"] == pytest.approx(.1)
+    assert report["diagnostic_provenance"]["selected_models"] == manifest["selected_models"]
+    assert report["matched_easy_subset"]["fixed_re_reference"]["n_rows"] == 1
+    json.dumps(report, allow_nan=False)
+    # Never replace the original analysis, evaluation or an existing diagnostic.
+    with pytest.raises(SystemExit):
+        main(args)
+    wrong_output_args = [*args[:-1], str(tmp_path / "another.json")]
+    frozen.write_text(json.dumps({"split_geometries": {**split, "test": ["other"]}}))
+    with pytest.raises(ValueError, match="frozen geometry split"):
+        main(wrong_output_args)
+    frozen.write_text(json.dumps({"split_geometries": split}))
+    (tmp_path / "polars.csv").write_text("changed input")
+    with pytest.raises(ValueError, match="fingerprint"):
+        main(wrong_output_args)
+    assert len(predictions) == 1
 
 
 def test_summary_omits_lift_to_drag_when_drag_is_not_a_target(rows):

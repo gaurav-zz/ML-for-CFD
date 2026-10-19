@@ -260,6 +260,9 @@ def test_training_uses_only_train_validation_and_records_provenance(cells):
     assert values["source_sha256"] == "SOURCE_SHA256" and values["source_mode"] == "SOURCE_MODE"
     assert values["gpu"] == "GPU_METADATA" and values["gpu_tests_passed"] == "GPU_TESTS_PASSED"
     assert values["accelerator"] == "ACCELERATOR"
+    assert values["machine_shape"] == "globals().get('KAGGLE_MACHINE_SHAPE')"
+    assert values["device"] == "'cuda' if ACCELERATOR == 'gpu' else 'cpu'"
+    assert values["inference_device"] == "'cpu-numpy'"
     assert "'torch'" in values["packages"] and "'pytest'" in values["packages"]
 
 

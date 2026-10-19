@@ -1,0 +1,58 @@
+{
+  "selection_metric": "validation_per_target",
+  "selected_models": {
+    "Cl": "torch_mlp_huber",
+    "Cd": "torch_mlp_huber",
+    "Cm": "torch_mlp_huber"
+  },
+  "selection_metrics": {
+    "Cl": "rmse",
+    "Cd": "median_relative_error",
+    "Cm": "rmse"
+  },
+  "target_names": [
+    "Cl",
+    "Cd",
+    "Cm"
+  ],
+  "target_transforms": {
+    "Cl": "identity",
+    "Cd": "log",
+    "Cm": "identity"
+  },
+  "results": [
+    {
+      "model": "torch_mlp_huber",
+      "target": "Cl",
+      "mae": 0.04394133894458515,
+      "rmse": 0.08687594030147656,
+      "r2": 0.9871140431090842,
+      "mean_relative_error": 0.3948647843121154,
+      "median_relative_error": 0.03813765374607342,
+      "batch_inference_time_seconds": 4.726462455999808,
+      "n_predictions": 116484
+    },
+    {
+      "model": "torch_mlp_huber",
+      "target": "Cd",
+      "mae": 0.004045968272452457,
+      "rmse": 0.011540327820375288,
+      "r2": 0.8766388835215897,
+      "mean_relative_error": 0.09019055140162456,
+      "median_relative_error": 0.05572903434415842,
+      "batch_inference_time_seconds": 4.726462455999808,
+      "n_predictions": 116484
+    },
+    {
+      "model": "torch_mlp_huber",
+      "target": "Cm",
+      "mae": 0.00665808702221373,
+      "rmse": 0.01297230883019256,
+      "r2": 0.9368674180119342,
+      "mean_relative_error": 0.6917929416203974,
+      "median_relative_error": 0.09649760948968417,
+      "batch_inference_time_seconds": 4.726462455999808,
+      "n_predictions": 116484
+    }
+  ]
+}

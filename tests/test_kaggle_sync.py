@@ -174,8 +174,31 @@ def test_kernel_cpu_override_and_explicit_gpu_shape(tmp_path):
     assert json.loads((stage / "kernel-metadata.json").read_text())["enable_gpu"] is False
     stage = stage_kernel("me/run", "me/data", tmp_path / "gpu", machine_shape="NvidiaTeslaT4")
     assert json.loads((stage / "kernel-metadata.json").read_text())["machine_shape"] == "NvidiaTeslaT4"
+    source = "".join(json.loads((stage / "v2_experiment_kaggle.ipynb").read_text())["cells"][0]["source"])
+    assert "KAGGLE_MACHINE_SHAPE = 'NvidiaTeslaT4'" in source
     with pytest.raises(ValueError, match="requires the GPU"):
         stage_kernel("me/run", "me/data", tmp_path / "bad", accelerator="cpu", machine_shape="NvidiaL4")
+
+
+def test_study_notebook_reuses_preflight_without_standard_test_cells(tmp_path):
+    staged = stage_kernel("me/study", "me/data", tmp_path / "study", study=True)
+    document = json.loads((staged / "v2_experiment_kaggle.ipynb").read_text())
+    ids = [cell.get("id") for cell in document["cells"]]
+    assert "kaggle-gpu-tests" in ids and "v2-data" in ids
+    assert ids[-1] == "v2-train"
+    assert "test-results" not in ids and "v2-analysis" not in ids
+    training = "".join(document["cells"][-1]["source"])
+    assert "run_study(split, feature_columns, target_columns, RUN_OUTPUT" in training
+    assert "compare_models(" not in training and "split.test" not in training
+    for cell in document["cells"]:
+        if cell["cell_type"] == "code":
+            compile("".join(cell["source"]), cell["id"], "exec")
+
+
+def test_cli_zero_exit_push_error_is_not_reported_as_success():
+    runner = FakeRunner(stdout="Kernel push error: Maximum batch GPU session count of 2 reached.")
+    with pytest.raises(RuntimeError, match="Maximum batch GPU"):
+        kaggle_sync._run(["kaggle", "kernels", "push", "-p", "/unused"], runner)
 
 
 def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
@@ -196,6 +219,9 @@ def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
         paths = archive.namelist()
         assert "src/training/comparison.py" in paths
         assert "configs/frozen_split.json" in paths
+        assert "configs/accuracy_baseline/test_metrics.csv" in paths
+        assert "configs/accuracy_baseline/run.json" in paths
+        assert "configs/accuracy_baseline/test_evaluation.json" in paths
         assert "requirements-kaggle.txt" in paths
         assert "notebooks/v2_experiment_kaggle.ipynb" in paths
         assert all(path.startswith(("src/", "tests/", "configs/", "notebooks/", "requirements", "pyproject")) for path in paths)

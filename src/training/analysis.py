@@ -15,9 +15,7 @@ import pandas as pd
 from src.geometry.descriptors import DESCRIPTOR_NAMES
 from src.utils.metrics import regression_metrics
 
-# XFOIL polars in this archive run to +/-24 degrees and about 17% of rows lie
-# beyond this magnitude, where the flow is separated and the surrogate is
-# fitting a different physical regime.
+# This fixed angle proxy is not a measurement of physical stall or separation.
 STALL_ALPHA = 12.0
 
 PREDICTED_SUFFIX = "_predicted"
@@ -28,10 +26,16 @@ METRIC_NAMES = (
 
 
 def _metrics(frame: pd.DataFrame, target: str) -> dict:
-    """Keep empty subsets explicit without passing them to sklearn metrics."""
-    if frame.empty:
+    """Score finite pairs only; undefined metrics stay strict-JSON nulls."""
+    columns = [target, target + PREDICTED_SUFFIX]
+    if any(name not in frame for name in columns):
         return dict.fromkeys(METRIC_NAMES)
-    return regression_metrics(frame[target], frame[target + PREDICTED_SUFFIX])
+    valid = np.isfinite(frame[columns].to_numpy(dtype=float)).all(axis=1)
+    if not valid.any():
+        return dict.fromkeys(METRIC_NAMES)
+    metrics = regression_metrics(frame.loc[valid, target], frame.loc[valid, columns[1]])
+    return {name: value if value is not None and np.isfinite(value) else None
+            for name, value in metrics.items()}
 
 
 def _records(table: pd.DataFrame) -> list[dict]:
@@ -86,10 +90,10 @@ def breakdown(frame: pd.DataFrame, target: str, by, label: str | None = None) ->
 
 
 def stall_regime(frame: pd.DataFrame, threshold: float = STALL_ALPHA) -> pd.Series:
-    """Label each row pre- or post-stall by angle-of-attack magnitude."""
+    """Legacy pre/post-stall labels are angle proxies, not measured flow states."""
     if "Alpha" not in frame.columns:
         raise ValueError("Frame must contain Alpha to split by flow regime.")
-    if not threshold > 0:
+    if not np.isfinite(threshold) or not threshold > 0:
         raise ValueError("The stall threshold must be a positive angle in degrees.")
     labels = np.where(frame["Alpha"].abs() > threshold, "post-stall", "pre-stall")
     return pd.Series(labels, index=frame.index, name="regime")
@@ -135,18 +139,184 @@ def lift_to_drag(frame: pd.DataFrame, lift: str = "Cl", drag: str = "Cd") -> pd.
     return ratios
 
 
+def _error_concentration(frame: pd.DataFrame, target: str) -> dict:
+    """Rank finite-pair squared errors by geometry without averaging geometries."""
+    columns = [target, target + PREDICTED_SUFFIX]
+    valid = (np.isfinite(frame[columns].to_numpy(dtype=float)).all(axis=1)
+             if all(name in frame for name in columns) else np.zeros(len(frame), dtype=bool))
+    usable = frame.loc[valid]
+    errors = (usable[["geometry_id"]].copy() if "geometry_id" in usable
+              else pd.DataFrame(columns=["geometry_id"]))
+    errors["sse"] = (usable[columns[0]] - usable[columns[1]]) ** 2 if len(usable) else 0.0
+    concentration = errors.groupby("geometry_id", observed=True, sort=True).agg(
+        n=("sse", "size"), sse=("sse", "sum"),
+    ).reset_index()
+    concentration["rmse"] = np.sqrt(concentration["sse"] / concentration["n"])
+    total_sse = float(concentration["sse"].sum())
+    concentration["sse_share"] = concentration["sse"] / total_sse if total_sse > 0 else 0.0
+    top = concentration.sort_values(["sse", "geometry_id"], ascending=[False, True]).head(10)
+    return {
+        "methodology": "Per-geometry finite-pair SSE; top 10 ranked by SSE. Shares divide by "
+        "this subset's SSE; all shares are zero when total SSE is zero.",
+        "total_sse": total_sse,
+        "top_10_sse_share": float(top["sse_share"].sum()),
+        "top_geometries": _records(top),
+    }
+
+
+def _diagnostic_subset(frame: pd.DataFrame, target: str, poststall_sse: float | None = None) -> dict:
+    concentration = _error_concentration(frame, target)
+    columns = [target, target + PREDICTED_SUFFIX]
+    n_scored = (int(np.isfinite(frame[columns].to_numpy(dtype=float)).all(axis=1).sum())
+                if all(name in frame for name in columns) else 0)
+    result = {
+        "n_rows": int(len(frame)),
+        "n_geometries": int(frame["geometry_id"].nunique()) if "geometry_id" in frame else 0,
+        "n_scored_rows": n_scored, "n_unscored_rows": int(len(frame) - n_scored),
+        "metrics": _metrics(frame, target), "sse": concentration["total_sse"],
+        "error_concentration": concentration,
+    }
+    if poststall_sse is not None:
+        result["sse_share_of_poststall"] = result["sse"] / poststall_sse if poststall_sse > 0 else 0.0
+    return result
+
+
+def poststall_alpha(frame: pd.DataFrame, target: str) -> dict:
+    """Fixed angle bands test whether errors cluster near 12 degrees or beyond 20."""
+    magnitude = frame["Alpha"].abs()
+    post = frame.loc[np.isfinite(magnitude) & (magnitude > STALL_ALPHA)]
+    overall = _diagnostic_subset(post, target)
+    bands = []
+    for label, lower, upper in (("(12,16]", 12, 16), ("(16,20]", 16, 20), (">20", 20, None)):
+        mask = np.isfinite(magnitude) & (magnitude > lower)
+        if upper is not None:
+            mask &= magnitude <= upper
+        bands.append({
+            "band": label, "lower_exclusive_degrees": lower, "upper_inclusive_degrees": upper,
+            **_diagnostic_subset(frame.loc[mask], target, overall["sse"]),
+        })
+    return {
+        "methodology": "Fixed |Alpha| bands, independent of summarize's configurable threshold. "
+        "Post-stall denotes only |Alpha| > 12, not measured stall or fully separated flow. "
+        "SSE shares use all finite-pair |Alpha| > 12 errors; R2 is subset-specific. "
+        "Relative errors are fractions, exclude exactly-zero actuals, and include both mean and median.",
+        "threshold_degrees": STALL_ALPHA, "overall": overall, "bands": bands,
+        "signed_alpha": [
+            {"sign": sign, **_diagnostic_subset(group, target, overall["sse"])}
+            for sign, group in (("negative", post.loc[post["Alpha"] < 0]),
+                                ("positive", post.loc[post["Alpha"] > 0]))
+        ],
+        "reynolds": [
+            {"Re": re, **_diagnostic_subset(group, target, overall["sse"])}
+            for re, group in post.groupby("Re", observed=True, sort=True)
+        ] if "Re" in post else [],
+    }
+
+
+def observed_cl_peak(frame: pd.DataFrame, *, min_angles: int = 5) -> dict:
+    """Locate signed-Cl maxima on observed half-polars, never infer physical stall.
+
+    Boundary/plateau maxima are censored, sparse curves are excluded, and Cd is
+    scored separately around interior and censored peaks. Alpha=0 is excluded
+    rather than duplicated into both signs. Positions, not index labels, join
+    observations back to curves so duplicate DataFrame indexes are harmless.
+    """
+    if not isinstance(min_angles, int) or min_angles < 3:
+        raise ValueError("min_angles must be an integer of at least 3.")
+    keys = ["geometry_id", "Re", "Ncrit"]
+    missing = [name for name in [*keys, "Alpha", "Cl"] if name not in frame]
+    data = frame.reset_index(drop=True)
+    usable = np.zeros(len(data), dtype=bool)
+    zero = np.zeros(len(data), dtype=bool)
+    if not missing:
+        finite = np.isfinite(data[["Re", "Ncrit", "Alpha", "Cl"]].to_numpy(dtype=float)).all(axis=1)
+        finite &= data["geometry_id"].notna().to_numpy()
+        zero = finite & (data["Alpha"].to_numpy() == 0)
+        usable = finite & ~zero
+    curves = data.loc[usable, [*keys, "Alpha", "Cl"]].copy() if not missing else pd.DataFrame()
+    states = np.full(len(data), "excluded", dtype=object)
+    regions = np.full(len(data), "excluded", dtype=object)
+    records = []
+    if not curves.empty:
+        curves["sign"] = np.where(curves["Alpha"] < 0, "negative", "positive")
+        curves["magnitude"] = curves["Alpha"].abs()
+        curves["signed_cl"] = np.where(curves["Alpha"] < 0, -curves["Cl"], curves["Cl"])
+        for key, group in curves.groupby([*keys, "sign"], observed=True, sort=True):
+            # Duplicate angles do not make a sparse curve dense; exact ties use
+            # the innermost observed angle and expose all tied peak positions.
+            angles = group.groupby("magnitude", sort=True)["signed_cl"].max()
+            peaks = angles.index[angles == angles.max()].to_numpy(dtype=float)
+            peak = float(peaks.min())
+            lower, upper = float(angles.index.min()), float(angles.index.max())
+            at_lower, at_upper = bool(lower in peaks), bool(upper in peaks)
+            boundary = "both" if at_lower and at_upper else "lower" if at_lower else "upper" if at_upper else None
+            state = "sparse" if len(angles) < min_angles else "boundary-censored" if boundary else "interior"
+            positions = group.index.to_numpy()
+            states[positions] = state
+            if state != "sparse":
+                distance = group["magnitude"].to_numpy() - peak
+                regions[positions] = np.where(np.abs(distance) <= 2, "near-peak",
+                                              np.where(distance < -2, "farther-pre-peak", "farther-post-peak"))
+            records.append({
+                **dict(zip([*keys, "sign"], key)), "n_rows": int(len(group)),
+                "n_angles": int(len(angles)), "state": state, "peak_boundary": boundary,
+                "observed_min_abs_alpha": lower, "observed_max_abs_alpha": upper,
+                "peak_alpha": -peak if key[-1] == "negative" else peak,
+                "peak_abs_alpha": peak, "max_signed_cl": float(angles.max()),
+                "n_tied_peak_angles": int(len(peaks)),
+            })
+    post_mask = np.isfinite(data["Alpha"]) & (data["Alpha"].abs() > STALL_ALPHA) if "Alpha" in data else usable
+    denominator = _error_concentration(data.loc[post_mask], "Cd")["total_sse"]
+    comparisons = []
+    for state in ("interior", "boundary-censored"):
+        comparisons.append({
+            "peak_state": state,
+            "n_curves": sum(record["state"] == state for record in records),
+            "regions": [
+                {"region": region, **_diagnostic_subset(data.loc[(states == state) & (regions == region)], "Cd"),
+                 "poststall": _diagnostic_subset(
+                     data.loc[(states == state) & (regions == region) & post_mask], "Cd", denominator,
+                 )}
+                for region in ("farther-pre-peak", "near-peak", "farther-post-peak")
+            ],
+        })
+    return {
+        "methodology": "Observed per-(geometry_id, Re, Ncrit, angle sign) maximum of sign(Alpha)*Cl; "
+        "not true physical Clmax, stall onset, or proof of fully separated flow. Zero-angle and "
+        "missing/nonfinite-key/Cl rows are excluded. Curves need at least min_angles distinct angles. "
+        "Any tied maximum at either observed angle boundary is boundary-censored; ties use the "
+        "innermost peak. Sparse curves are counted but excluded from Cd comparisons. Near-peak "
+        "means within +/-2 degrees inclusive; farther pre/post uses increasing |Alpha|. Interior "
+        "and censored comparisons are separate. Poststall SSE shares divide by all |Alpha| > 12 Cd SSE. "
+        "These are descriptive, target-conditioned diagnostics, never features or tuning criteria.",
+        "missing_columns": missing, "missing_cd_columns": [name for name in ("Cd", "Cd_predicted") if name not in data],
+        "min_angles": min_angles, "peak_window_degrees": 2.0,
+        "n_rows": int(len(data)), "n_usable_rows": int(usable.sum()),
+        "n_zero_alpha_rows": int(zero.sum()), "n_missing_or_nonfinite_rows": int((~(usable | zero)).sum()),
+        "n_curves": len(records),
+        "state_counts": {
+            state: {"n_curves": sum(record["state"] == state for record in records),
+                    "n_rows": int((states == state).sum())}
+            for state in ("interior", "boundary-censored", "sparse")
+        },
+        "curves": records, "cd_comparisons": comparisons,
+    }
+
+
 def summarize(
     frame: pd.DataFrame, target_names, threshold: float = STALL_ALPHA,
-    *, training_frame: pd.DataFrame | None = None,
+    *, training_frame: pd.DataFrame | None = None, reference_re: float = 1e6,
 ) -> dict:
     """Assemble every breakdown for a run report, as JSON-ready records.
 
-    Reynolds groups use observed values, never an assumed reference Reynolds
-    number. Optional domains use only training geometry descriptor ranges, not
+    Reynolds groups use observed values; the easy reference uses fixed Re=1e6
+    unless explicitly selected beforehand. Optional domains use training ranges, not
     evaluated target errors, and never remove rows from the pooled headline.
     Row masks are positional boolean lists in evaluated-frame order.
     """
     target_names = list(target_names)
+    if not np.isfinite(reference_re) or reference_re <= 0:
+        raise ValueError("reference_re must be finite and positive.")
     regime = stall_regime(frame, threshold)
     report = {
         "stall_threshold_degrees": threshold,
@@ -156,17 +326,8 @@ def summarize(
     }
     for target in target_names:
         geometry_scores = per_geometry(frame, target)
-        concentration = geometry_scores[["geometry_id", "n", "rmse"]].copy()
-        concentration["sse"] = concentration["n"] * concentration["rmse"] ** 2
-        total_sse = float(concentration["sse"].sum())
-        concentration["sse_share"] = (
-            concentration["sse"] / total_sse if total_sse > 0 else 0.0
-        )
-        top = concentration.sort_values(
-            ["sse", "geometry_id"], ascending=[False, True],
-        ).head(10)
         distributions = {}
-        for metric in ("mae", "rmse", "median_relative_error"):
+        for metric in ("mae", "rmse", "mean_relative_error", "median_relative_error"):
             values = geometry_scores[metric].dropna()
             distributions[metric] = {
                 "n_defined": int(len(values)),
@@ -178,15 +339,10 @@ def summarize(
         report["targets"][target] = {
             "overall": _metrics(frame, target),
             "regime": _records(breakdown(frame, target, regime, "regime")),
-            "reynolds": _records(breakdown(frame, target, "Re", "Re")),
+            "reynolds": _records(breakdown(frame, target, "Re", "Re")) if "Re" in frame else [],
             "worst_geometries": _records(worst_geometries(frame, target)),
-            "error_concentration": {
-                "methodology": "Per-geometry SSE = n * rmse^2; top 10 ranked by SSE. "
-                "Shares divide by total evaluated SSE; all shares are zero when total SSE is zero.",
-                "total_sse": total_sse,
-                "top_10_sse_share": float(top["sse_share"].sum()),
-                "top_geometries": _records(top),
-            },
+            "error_concentration": _error_concentration(frame, target),
+            "poststall_alpha": poststall_alpha(frame, target),
             "per_geometry_distribution": {
                 "methodology": "Unweighted per-airfoil metric quantiles (linear interpolation); "
                 "undefined relative errors are excluded and counted via n_defined.",
@@ -203,8 +359,10 @@ def summarize(
     easy = frame.loc[easy_mask]
     report["matched_easy_subset"] = {
         "methodology": "Fixed pre-stall |Alpha| <= threshold and Ncrit = 9; "
-        "all observed Reynolds numbers scored separately, with no assumed Re = 1e6. "
-        "Missing required columns yield an explicit empty subset; no target-error selection.",
+        "all observed Reynolds numbers scored separately alongside fixed_re_reference. "
+        "Missing required columns yield an explicit empty subset; no target-error selection. "
+        "Relative errors are fractions; compare mean to literature means, not median. "
+        "This is not an external-paper equality claim: data source, split, and averaging differ.",
         "criteria": {"max_abs_alpha_degrees": threshold, "Ncrit": 9},
         "missing_columns": missing,
         "row_mask": easy_mask.tolist(),
@@ -218,11 +376,22 @@ def summarize(
                      "n_geometries": int(group["geometry_id"].nunique()),
                      **_metrics(group, target)}
                     for re, group in easy.groupby("Re", observed=True, sort=True)
-                ],
+                ] if "Re" in easy else [],
             }
             for target in target_names
         },
     }
+    reference_mask = easy_mask & (frame["Re"] == reference_re) if "Re" in frame else easy_mask
+    reference = frame.loc[reference_mask]
+    report["matched_easy_subset"]["fixed_re_reference"] = {
+        "criteria": {"max_abs_alpha_degrees": threshold, "Ncrit": 9, "Re": float(reference_re)},
+        "methodology": "Re fixed in advance (default 1e6), exact equality, never best-test-Re selection. "
+        "Missing reference Re produces zero rows and null metrics; no fallback to another Re.",
+        "row_mask": reference_mask.tolist(), "n_rows": int(len(reference)),
+        "n_geometries": int(reference["geometry_id"].nunique()),
+        "targets": {target: _metrics(reference, target) for target in target_names},
+    }
+    report["observed_cl_peak"] = observed_cl_peak(frame)
 
     if training_frame is not None:
         training = training_frame.drop_duplicates("geometry_id")
@@ -283,3 +452,102 @@ def summarize(
             **_metrics(ratios, "lift_to_drag"),
         }
     return report
+
+
+def main(argv=None) -> None:
+    """Diagnose trusted, completed portable artifacts without fitting or Torch."""
+    import argparse
+    import hashlib
+    import json
+    from pathlib import Path
+
+    import joblib
+
+    from src.data.features import assemble_features
+    from src.models.torch_mlp import TorchMLPRegressor
+    from src.training.targets import PhysicalPredictor
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("run_dir", type=Path, help="Trusted local completed Kaggle run (joblib is executable).")
+    parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
+    parser.add_argument("--frozen-split", type=Path, default=Path("configs/frozen_split.json"))
+    parser.add_argument("--reference-re", type=float, default=1e6)
+    parser.add_argument("--output", type=Path, help="Optional new JSON file; default is stdout. Never overwrites.")
+    args = parser.parse_args(argv)
+    if args.output is not None and (args.output.exists() or not args.output.parent.is_dir()):
+        parser.error("Output must be a new file in an existing directory.")
+    run = args.run_dir.resolve()
+    manifest = json.loads((run / "run.json").read_text())
+    frozen = json.loads(args.frozen_split.read_text())
+    metadata = manifest["run_metadata"]
+    targets = manifest["target_names"]
+    selected = manifest["selected_models"]
+    if manifest["status"] != "completed" or set(selected) != set(targets):
+        raise ValueError("A completed manifest with frozen winners for all targets is required.")
+    partitions = metadata["split_geometries"]
+    if partitions != frozen["split_geometries"]:
+        raise ValueError("Run partitions do not match the frozen geometry split.")
+    for left, right in (("train", "validation"), ("train", "test"), ("validation", "test")):
+        if set(partitions[left]) & set(partitions[right]):
+            raise ValueError("Frozen geometry partitions overlap.")
+    dataset = metadata["dataset"]
+    paths, fingerprints = {}, {}
+    for name in ("geometry", "polars"):
+        path = args.data_dir / dataset[name + "_table"]
+        with path.open("rb") as stream:
+            checksum = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                checksum.update(chunk)
+            digest = checksum.hexdigest()
+        if digest != dataset[name + "_sha256"]:
+            raise ValueError(f"{name} table fingerprint differs from the completed run.")
+        paths[name], fingerprints[name] = path, digest
+    geometry = pd.read_csv(paths["geometry"])
+    # Filter narrow polar chunks before attaching 108 geometry columns. Never
+    # materialize the full wide train/validation/test design matrix locally.
+    chunks, n_polars = [], 0
+    for chunk in pd.read_csv(paths["polars"], chunksize=100_000):
+        n_polars += len(chunk)
+        chunks.append(chunk.loc[chunk["geometry_id"].isin(partitions["test"])])
+    polars = pd.concat(chunks, ignore_index=True)
+    if len(geometry) != dataset["geometry_rows"] or n_polars != dataset["polar_rows"]:
+        raise ValueError("Dataset row counts differ from the completed run.")
+    if len(polars) != metadata["split_rows"]["test"] or set(polars["geometry_id"]) != set(partitions["test"]):
+        raise ValueError("Test rows/geometries differ from the completed run.")
+    rows, columns = assemble_features(polars, geometry)
+    if columns != metadata["feature_columns"]:
+        raise ValueError("Named feature columns differ from the completed run.")
+    predictions = np.empty((len(rows), len(targets)))
+    for name in dict.fromkeys(selected.values()):
+        result = manifest["results"][name]
+        if result["status"] != "success" or name not in ("torch_mlp_mse", "torch_mlp_huber"):
+            raise ValueError("Diagnostic CLI only loads successful portable NumPy MLP artifacts.")
+        path = (run / result["model_path"]).resolve()
+        if not path.is_relative_to(run):
+            raise ValueError("Model artifact must be inside the trusted run directory.")
+        model = joblib.load(path)
+        if not isinstance(model, TorchMLPRegressor) or list(model.target_names) != targets:
+            raise ValueError("Artifact is not the expected named-target portable MLP.")
+        values = PhysicalPredictor(model, targets, manifest["target_transforms"]).predict(rows[columns])
+        for index, target in enumerate(targets):
+            if selected[target] == name:
+                predictions[:, index] = values[:, index]
+    scored = prediction_frame(rows, predictions, targets)
+    report = summarize(scored, targets, reference_re=args.reference_re)
+    report["diagnostic_provenance"] = {
+        "run_dir": str(run), "source_sha256": metadata.get("source_sha256"),
+        "dataset_sha256": fingerprints, "split": "frozen geometry-disjoint test",
+        "selected_models": selected, "inference": "saved weights, CPU NumPy only; no fitting or Torch",
+        "reference_re": args.reference_re,
+    }
+    serialized = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    if args.output is None:
+        print(serialized, end="")
+    else:
+        with args.output.open("x", encoding="utf-8") as stream:
+            stream.write(serialized)
+        print(f"Diagnostics: {len(rows)} frozen test rows -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()
