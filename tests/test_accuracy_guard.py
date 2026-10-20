@@ -380,7 +380,8 @@ def test_workflow_has_explicit_fit_free_allowlist_and_safe_dispatch():
     command = next(step["run"] for step in portable["steps"] if "pytest -q" in step.get("run", ""))
     assert command.split()[4:] == ["tests/test_accuracy_guard.py", "tests/test_metrics.py",
                                     "tests/test_evaluation.py", "tests/test_kaggle_sync.py",
-                                    "tests/test_analysis.py", "tests/test_study.py"]
+                                    "tests/test_analysis.py", "tests/test_study.py", "tests/test_auxiliary.py",
+                                    "tests/test_features.py", "tests/test_tail_risk.py", "tests/test_auxiliary_study.py"]
     cloud = workflow["jobs"]["cloud-accuracy"]
     assert cloud["if"] == "github.event_name == 'workflow_dispatch'"
     script = next(step["run"] for step in cloud["steps"] if "pull_run(" in step.get("run", ""))

@@ -190,6 +190,7 @@ def compare_models(
     x_train, y_train, x_validation, y_validation, target_names, output_dir,
     model_configs=None, run_metadata=None, target_transforms=None,
     selection_metrics=None,
+    auxiliary_train=None, auxiliary_validation=None,
 ):
     """Fit sequentially and select by explicit per-target validation metrics.
 
@@ -211,6 +212,11 @@ def compare_models(
         raise ValueError("Select on rmse, mae, or median_relative_error (lower is better).")
     _validate_targets(x_train, y_train, target_names)
     _validate_targets(x_validation, y_validation, target_names)
+    if (auxiliary_train is None) != (auxiliary_validation is None):
+        raise ValueError("Supply both training and validation auxiliary labels, or neither.")
+    if auxiliary_train is not None:
+        if len(auxiliary_train) != len(x_train) or len(auxiliary_validation) != len(x_validation):
+            raise ValueError("Auxiliary labels must match their training/validation row counts.")
     transforms = transform_names(target_names, target_transforms)
     transformed = any(name != "identity" for name in transforms.values())
     # Leave the arrays untouched when nothing is transformed, so no copy of a
@@ -239,8 +245,11 @@ def compare_models(
         names.add(name)
         if not isinstance(config["parameters"], dict) or type(config["scale_targets"]) is not bool:
             raise ValueError("Model parameters must be a dict and scale_targets must be a bool.")
-        if {"name", "x_train", "y_train", "output_dir", "scale_targets", "validation_data", "target_names"}.intersection(config["parameters"]):
+        if {"name", "x_train", "y_train", "output_dir", "scale_targets", "validation_data", "target_names",
+            "auxiliary_targets", "validation_auxiliary_targets"}.intersection(config["parameters"]):
             raise ValueError("Model parameters must not override training inputs or artifact settings.")
+        if auxiliary_train is not None and not name.startswith("torch_mlp_"):
+            raise ValueError("Auxiliary labels require a Torch MLP configuration.")
         if name.startswith("torch_mlp_") and config["scale_targets"]:
             raise ValueError("Torch MLP requires scale_targets=False.")
 
@@ -298,6 +307,11 @@ def compare_models(
                         target_names=tuple(target_names),
                         validation_data=(x_validation, fitting_validation),
                     )
+                    if auxiliary_train is not None:
+                        training_parameters.update(
+                            auxiliary_targets=auxiliary_train,
+                            validation_auxiliary_targets=auxiliary_validation,
+                        )
                 model, elapsed = train_model(
                     name, x_train, fitting_targets, output_dir=model_dir,
                     scale_targets=config["scale_targets"], **training_parameters,

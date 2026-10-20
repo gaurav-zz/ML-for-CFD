@@ -311,6 +311,73 @@ def test_drag_selection_can_prioritize_typical_relative_error_without_test_reran
     assert evaluated["selection_metric"] == "validation_per_target"
 
 
+def test_auxiliary_labels_are_fit_only_and_primary_reports_stay_unchanged(tmp_path, monkeypatch):
+    x = np.array([[1., -3., .2], [2., -2., .3]])
+    y = x.copy()
+    y[:, 1] = np.exp(y[:, 1])
+    auxiliary = np.array([-.001, np.nan])
+    seen = {}
+    def trainer(name, x_train, fitting_targets, output_dir, **parameters):
+        seen.update(parameters)
+        np.testing.assert_allclose(fitting_targets, x)
+        model = OffsetRegressor([0, 0, 0])
+        joblib.dump(model, output_dir / f"{name}.joblib")
+        return model, .01
+    monkeypatch.setattr(comparison, "train_model", trainer)
+    output = tmp_path / "auxiliary"
+    table = comparison.compare_models(
+        x, y, x, y, ["Cl", "Cd", "Cm"], output,
+        [{"name": "torch_mlp_huber", "parameters": {"auxiliary_weight": .1}, "scale_targets": False}],
+        target_transforms={"Cd": "log"}, auxiliary_train=auxiliary, auxiliary_validation=auxiliary,
+    )
+    assert seen["auxiliary_targets"] is auxiliary
+    assert seen["validation_auxiliary_targets"] is auxiliary
+    assert list(table.target) == ["Cl", "Cd", "Cm"]
+    manifest = read_json(output / "run.json")
+    assert manifest["target_names"] == ["Cl", "Cd", "Cm"]
+    assert manifest["target_transforms"] == {"Cl": "identity", "Cd": "log", "Cm": "identity"}
+
+
+@pytest.mark.parametrize("training,validation", [([1.], None), ([1.], [1., 2.])])
+def test_auxiliary_label_routing_requires_aligned_both_partitions(tmp_path, training, validation):
+    with pytest.raises(ValueError, match="auxiliary|Auxiliary"):
+        comparison.compare_models([[1.]], [[1.]], [[1.]], [[1.]], ["Cl"], tmp_path / "bad",
+                                  auxiliary_train=training, auxiliary_validation=validation)
+    assert not (tmp_path / "bad").exists()
+
+
+def test_auxiliary_labels_never_route_to_cpu_estimator_factories(tmp_path):
+    with pytest.raises(ValueError, match="Torch MLP"):
+        comparison.compare_models(
+            [[1.]], [[1.]], [[1.]], [[1.]], ["Cl"], tmp_path / "bad",
+            [{"name": "linear", "parameters": {}, "scale_targets": False}],
+            auxiliary_train=[1.], auxiliary_validation=[1.],
+        )
+    assert not (tmp_path / "bad").exists()
+
+
+def test_train_routes_auxiliary_arrays_to_fit_not_constructor(tmp_path, monkeypatch):
+    from src.training import train
+
+    seen = {}
+    class Stub:
+        def fit(self, x, y, **kwargs):
+            seen["fit"] = kwargs
+            return self
+    def builder(**kwargs):
+        seen["constructor"] = kwargs
+        return Stub()
+    monkeypatch.setitem(train.MODEL_BUILDERS, "torch_mlp_huber", builder)
+    monkeypatch.setattr(train.joblib, "dump", lambda *args: None)
+    aux = np.array([.02])
+    train.train_model("torch_mlp_huber", [[1]], [[2]], tmp_path,
+                      validation_data=([[3]], [[4]]), auxiliary_weight=.1,
+                      auxiliary_targets=aux, validation_auxiliary_targets=aux)
+    assert seen["constructor"] == {"auxiliary_weight": .1}
+    assert seen["fit"]["auxiliary_targets"] is aux
+    assert seen["fit"]["validation_auxiliary_targets"] is aux
+
+
 @pytest.mark.parametrize("metrics", [{"Unknown": "rmse"}, {"Cl": "r2"}])
 def test_invalid_selection_metrics_fail_before_creating_artifacts(tmp_path, metrics):
     with pytest.raises(ValueError, match="Selection metrics|Select on"):

@@ -41,11 +41,15 @@ def train_model(
     *,
     scale_targets: bool = False,
     validation_data=None,
+    auxiliary_targets=None,
+    validation_auxiliary_targets=None,
     **kwargs,
 ) -> tuple[object, float]:
     """Fit and save a model, optionally standardizing training targets only."""
     if name not in MODEL_BUILDERS:
         raise ValueError(f"Unknown model {name!r}; choose from {sorted(MODEL_BUILDERS)}")
+    if (auxiliary_targets is not None or validation_auxiliary_targets is not None) and not name.startswith("torch_mlp_"):
+        raise ValueError("Auxiliary labels are supported only by Torch MLP training.")
     model = MODEL_BUILDERS[name](**kwargs)
     if name.startswith("torch_mlp_") and scale_targets:
         raise ValueError("Torch MLP normalizes its own targets; use scale_targets=False.")
@@ -56,7 +60,11 @@ def train_model(
         model = MultiOutputRegressor(model)
     started = time.perf_counter()
     if name.startswith("torch_mlp_"):
-        model.fit(x_train, y_train, validation_data=validation_data)
+        fit_parameters = {"validation_data": validation_data}
+        if auxiliary_targets is not None or validation_auxiliary_targets is not None:
+            fit_parameters.update(auxiliary_targets=auxiliary_targets,
+                                  validation_auxiliary_targets=validation_auxiliary_targets)
+        model.fit(x_train, y_train, **fit_parameters)
     else:
         model.fit(x_train, y_train)
     elapsed = time.perf_counter() - started

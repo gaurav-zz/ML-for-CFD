@@ -36,6 +36,8 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
     weights are experiment choices, not numeric weights quoted from a paper.
     With symmetry enabled, target_names defines the order and known parity;
     array targets must follow that order and DataFrames must match it exactly.
+    Optional Cdp supervision is identity-scaled, missing-label aware, and never
+    changes the primary loss denominator or validation stopping criterion.
     """
 
     def __init__(
@@ -56,6 +58,7 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
         lr_factor=0.5,
         random_state=42,
         device="auto",
+        auxiliary_weight=0.0,
     ):
         self.hidden_layers = hidden_layers
         self.max_iter = max_iter
@@ -73,6 +76,7 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
         self.lr_factor = lr_factor
         self.random_state = random_state
         self.device = device
+        self.auxiliary_weight = auxiliary_weight
 
     def _validate_params(self):
         for name in ("max_iter", "batch_size", "patience", "lr_patience"):
@@ -83,7 +87,7 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
                 or any(isinstance(n, bool) or not isinstance(n, Integral) or n < 1
                        for n in self.hidden_layers)):
             raise ValueError("hidden_layers must contain positive integer widths.")
-        for name in ("learning_rate_init", "weight_decay", "huber_delta", "min_delta", "lr_factor"):
+        for name in ("learning_rate_init", "weight_decay", "huber_delta", "min_delta", "lr_factor", "auxiliary_weight"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value):
                 raise ValueError(f"{name} must be a finite number.")
@@ -91,6 +95,8 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             raise ValueError("learning_rate_init and huber_delta must be positive.")
         if self.weight_decay < 0 or self.min_delta < 0:
             raise ValueError("weight_decay and min_delta must be nonnegative.")
+        if self.auxiliary_weight < 0:
+            raise ValueError("auxiliary_weight must be nonnegative.")
         if not 0 < self.lr_factor < 1:
             raise ValueError("lr_factor must be between zero and one.")
         if self.loss not in ("mse", "huber"):
@@ -103,8 +109,10 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
                 or any(not isinstance(name, str) for name in self.target_names)
                 or len(set(self.target_names)) != len(self.target_names)):
             raise ValueError("target_names must be a nonempty tuple of unique target names.")
-        if self.symmetry and not set(self.target_names).issubset({"Cl", "Cd", "Cm"}):
-            raise ValueError("Symmetry requires known target_names: Cl, Cd (logCd), and Cm.")
+        if not set(self.target_names).issubset({"Cl", "Cd", "Cm"}):
+            raise ValueError("target_names must contain only primary targets: Cl, Cd (logCd), and Cm.")
+        if self.auxiliary_weight > 0 and self.target_names != ("Cl", "Cd", "Cm"):
+            raise ValueError("Auxiliary Cdp requires target_names=('Cl', 'Cd', 'Cm') in that order.")
         if (not isinstance(self.target_weights, (tuple, list))
                 or len(self.target_weights) != len(self.target_names)
                 or any(isinstance(w, bool) or not isinstance(w, Real)
@@ -165,8 +173,41 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             for name in (*names, *EXTRA_FEATURE_NAMES)
         ], dtype=np.float32)
 
-    def fit(self, X, y, *, validation_data=None):
-        """Fit with explicit validation-only scheduling/stopping; no test access."""
+    @staticmethod
+    def _auxiliary_array(values, n_rows):
+        """Cdp is signed, identity-space supervision; NaN denotes missingness."""
+        if values is None:
+            return np.full((n_rows, 1), np.nan, dtype=np.float32)
+        if isinstance(values, pd.DataFrame) and tuple(values.columns) != ("Cdp",):
+            raise ValueError("auxiliary_targets DataFrame must contain only Cdp.")
+        try:
+            if isinstance(values, (tuple, list)) and any(
+                isinstance(value, (bool, np.bool_)) for value in np.asarray(values, dtype=object).flat
+            ):
+                raise ValueError("Boolean Cdp labels are invalid, including mixed numeric lists.")
+            values = np.asarray(values)
+            if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
+                raise ValueError("auxiliary_targets must be real numeric Cdp, not bool.")
+            with np.errstate(over="ignore", invalid="ignore"):
+                values = values.astype(np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("auxiliary_targets must be real numeric float32 Cdp, with NaN for missing labels.") from exc
+        if values.shape == (n_rows,):
+            values = values[:, None]
+        if values.shape != (n_rows, 1):
+            raise ValueError(f"auxiliary_targets must have shape ({n_rows},) or ({n_rows}, 1).")
+        if np.isinf(values).any():
+            raise ValueError("auxiliary_targets cannot contain Inf or exceed the float32 range.")
+        return values
+
+    def fit(self, X, y, *, validation_data=None, auxiliary_targets=None,
+            validation_auxiliary_targets=None):
+        """Fit using primary validation loss only for scheduling/stopping.
+
+        Cdp labels are separate from X/y, shape (n,) or (n, 1), with NaN for
+        missing labels. Enabled supervision requires observed training labels;
+        validation Cdp may be absent. Weight zero rejects supplied Cdp labels.
+        """
         self._validate_params()
         if (not isinstance(validation_data, (tuple, list)) or len(validation_data) != 2
                 or any(value is None for value in validation_data)):
@@ -175,6 +216,14 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
         y_train = self._target_array(y, len(x_train))
         x_val = self._feature_array(validation_data[0], X.columns)
         y_val = self._target_array(validation_data[1], len(x_val))
+        auxiliary_enabled = self.auxiliary_weight > 0
+        if not auxiliary_enabled and (auxiliary_targets is not None or validation_auxiliary_targets is not None):
+            raise ValueError("auxiliary_targets require auxiliary_weight > 0; omit both auxiliary arrays for the baseline.")
+        if auxiliary_enabled:
+            auxiliary_train = self._auxiliary_array(auxiliary_targets, len(x_train))
+            auxiliary_val = self._auxiliary_array(validation_auxiliary_targets, len(x_val))
+            if not np.isfinite(auxiliary_train).any():
+                raise ValueError("Auxiliary Cdp requires at least one observed training label.")
         try:
             import torch
         except ImportError as exc:
@@ -205,12 +254,22 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             for start in range(0, len(x_train), self.batch_size):
                 self.input_scaler_.partial_fit(x_train[start:start + self.batch_size] * self.reflection_signs_)
         self.target_scaler_ = StandardScaler().fit(y_train)
+        self.__dict__.pop("auxiliary_scaler_", None)
+        if auxiliary_enabled:
+            self.auxiliary_scaler_ = StandardScaler().fit(auxiliary_train[np.isfinite(auxiliary_train)].reshape(-1, 1))
         input_mean = torch.as_tensor(self.input_scaler_.mean_, dtype=torch.float32, device=device)
         input_scale = torch.as_tensor(self.input_scaler_.scale_, dtype=torch.float32, device=device)
         target_mean = torch.as_tensor(self.target_scaler_.mean_, dtype=torch.float32, device=device)
         target_scale = torch.as_tensor(self.target_scaler_.scale_, dtype=torch.float32, device=device)
         reflection = torch.as_tensor(self.reflection_signs_, device=device)
         target_signs = torch.as_tensor(self.target_signs_, device=device)
+        network_mean, network_scale, network_signs = target_mean, target_scale, target_signs
+        if auxiliary_enabled:
+            auxiliary_mean = torch.as_tensor(self.auxiliary_scaler_.mean_, dtype=torch.float32, device=device)
+            auxiliary_scale = torch.as_tensor(self.auxiliary_scaler_.scale_, dtype=torch.float32, device=device)
+            network_mean = torch.cat((target_mean, auxiliary_mean))
+            network_scale = torch.cat((target_scale, auxiliary_scale))
+            network_signs = torch.cat((target_signs, torch.ones(1, device=device)))
         weights = torch.tensor(self.target_weights, dtype=torch.float32, device=device)
         widths = (x_train.shape[1], *self.hidden_layers, self.n_outputs_)
         layers = []
@@ -218,6 +277,16 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             layers.append(torch.nn.Linear(int(left), int(right)))
             if index < len(widths) - 2:
                 layers.append(torch.nn.SiLU())
+        if auxiliary_enabled:
+            # Draw the unchanged primary head FIRST: Linear(width, 4) directly
+            # would consume an extra weight row before drawing primary biases.
+            primary = layers[-1]
+            auxiliary = torch.nn.Linear(int(widths[-2]), 1)
+            joint = torch.nn.Linear(int(widths[-2]), self.n_outputs_ + 1)
+            with torch.no_grad():
+                joint.weight.copy_(torch.cat((primary.weight, auxiliary.weight)))
+                joint.bias.copy_(torch.cat((primary.bias, auxiliary.bias)))
+            layers[-1] = joint
         network = torch.nn.Sequential(*layers).to(device)
         optimizer = torch.optim.RAdam(network.parameters(), lr=self.learning_rate_init, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -231,9 +300,9 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
                 reflected = network((raw * reflection - input_mean) / input_scale)
                 # Odd targets can have nonzero training means. Project in unscaled
                 # Cl/logCd/Cm coordinates, THEN standardize for the loss.
-                prediction = (prediction * target_scale + target_mean
-                              + target_signs * (reflected * target_scale + target_mean)) * 0.5
-                prediction = (prediction - target_mean) / target_scale
+                prediction = (prediction * network_scale + network_mean
+                              + network_signs * (reflected * network_scale + network_mean)) * 0.5
+                prediction = (prediction - network_mean) / network_scale
             return prediction
 
         def batch_loss(prediction, target):
@@ -245,14 +314,33 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
                 )
             return (elementwise * weights).sum(dim=1).mean() / weights.sum()
 
+        def auxiliary_loss(prediction, target):
+            mask = ~torch.isnan(target)
+            count = int(mask.sum().item())
+            # Select before normalization/loss: multiplying NaN losses by zero
+            # would still poison gradients. Empty selection gives zero gradient.
+            target = (target[mask] - auxiliary_mean) / auxiliary_scale
+            prediction = prediction[mask]
+            if self.loss == "mse":
+                elementwise = (prediction - target).square()
+            else:
+                elementwise = torch.nn.functional.huber_loss(
+                    prediction, target, reduction="none", delta=self.huber_delta,
+                )
+            return elementwise.sum() / max(count, 1), count
+
         # Entire datasets stay float32 on CPU; only bounded batches go to GPU.
         train_x = torch.from_numpy(x_train)
         train_y = torch.from_numpy(y_train)
         val_x = torch.from_numpy(x_val)
         val_y = torch.from_numpy(y_val)
+        if auxiliary_enabled:
+            train_auxiliary = torch.from_numpy(auxiliary_train)
+            val_auxiliary = torch.from_numpy(auxiliary_val)
         best_loss = float("inf")
         patience_loss = float("inf")
         best_state = None
+        best_auxiliary_loss = None
         stale_epochs = 0
         history = []
         stop_reason = "max_iter"
@@ -260,32 +348,57 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             network.train()
             order = torch.randperm(len(train_x), generator=generator)
             train_sum = 0.0
+            train_total_sum = 0.0
+            train_auxiliary_sum, train_auxiliary_count = 0.0, 0
             for start in range(0, len(train_x), self.batch_size):
                 indices = order[start:start + self.batch_size]
                 raw = train_x[indices].to(device)
                 target = (train_y[indices].to(device) - target_mean) / target_scale
                 optimizer.zero_grad(set_to_none=True)
-                value = batch_loss(normalized_prediction(raw), target)
+                prediction = normalized_prediction(raw)
+                primary_value = batch_loss(prediction[:, :self.n_outputs_], target)
+                value = primary_value
+                if auxiliary_enabled:
+                    auxiliary_value, count = auxiliary_loss(
+                        prediction[:, self.n_outputs_:], train_auxiliary[indices].to(device),
+                    )
+                    value = primary_value + self.auxiliary_weight * auxiliary_value
+                    train_auxiliary_sum += float(auxiliary_value.detach().item()) * count
+                    train_auxiliary_count += count
                 if not torch.isfinite(value):
                     raise RuntimeError("Nonfinite training loss; check target scales and learning_rate_init.")
                 value.backward()
                 optimizer.step()
-                train_sum += float(value.detach().item()) * len(indices)
+                train_sum += float(primary_value.detach().item()) * len(indices)
+                train_total_sum += float(value.detach().item()) * len(indices)
             network.eval()
             val_sum = 0.0
+            val_auxiliary_sum, val_auxiliary_count = 0.0, 0
             with torch.no_grad():
                 for start in range(0, len(val_x), self.batch_size):
                     raw = val_x[start:start + self.batch_size].to(device)
                     target = (val_y[start:start + self.batch_size].to(device) - target_mean) / target_scale
-                    value = batch_loss(normalized_prediction(raw), target)
+                    prediction = normalized_prediction(raw)
+                    value = batch_loss(prediction[:, :self.n_outputs_], target)
                     val_sum += float(value.item()) * len(raw)
+                    if auxiliary_enabled:
+                        auxiliary_value, count = auxiliary_loss(
+                            prediction[:, self.n_outputs_:], val_auxiliary[start:start + self.batch_size].to(device),
+                        )
+                        val_auxiliary_sum += float(auxiliary_value.item()) * count
+                        val_auxiliary_count += count
             validation_loss = val_sum / len(val_x)
+            train_auxiliary_loss = train_auxiliary_sum / train_auxiliary_count if train_auxiliary_count else None
+            validation_auxiliary_loss = val_auxiliary_sum / val_auxiliary_count if val_auxiliary_count else None
             if not np.isfinite(validation_loss):
                 raise RuntimeError("Nonfinite validation loss; check validation values and target scales.")
+            if validation_auxiliary_loss is not None and not np.isfinite(validation_auxiliary_loss):
+                raise RuntimeError("Nonfinite auxiliary validation loss; check Cdp values and target scales.")
             learning_rate = float(optimizer.param_groups[0]["lr"])
             scheduler.step(validation_loss)
             if validation_loss < best_loss:
                 best_loss = validation_loss
+                best_auxiliary_loss = validation_auxiliary_loss
                 self.best_epoch_ = epoch
                 best_state = {name: tensor.detach().cpu().clone() for name, tensor in network.state_dict().items()}
             if validation_loss < patience_loss - self.min_delta:
@@ -294,7 +407,12 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             else:
                 stale_epochs += 1
             history.append({"epoch": epoch, "train_loss": train_sum / len(train_x),
-                            "validation_loss": validation_loss, "learning_rate": learning_rate})
+                            "validation_loss": validation_loss, "learning_rate": learning_rate,
+                            "train_primary_loss": train_sum / len(train_x),
+                            "validation_primary_loss": validation_loss,
+                            "train_auxiliary_loss": train_auxiliary_loss,
+                            "validation_auxiliary_loss": validation_auxiliary_loss,
+                            "train_total_loss": train_total_sum / len(train_x)})
             if len(history) > 300:
                 history.pop(0)
             if epoch == 1 or epoch % 10 == 0:
@@ -321,6 +439,13 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             "patience": int(self.patience), "stale_epochs": stale_epochs, "min_delta": float(self.min_delta),
             "restored_best_checkpoint": True, "loss": self.loss, "huber_delta": float(self.huber_delta),
             "target_weights": [float(w) for w in self.target_weights], "target_names": list(self.target_names),
+            "stopping_metric": "primary_normalized_validation_loss",
+            "auxiliary_weight": float(self.auxiliary_weight),
+            "auxiliary_name": "Cdp" if auxiliary_enabled else None,
+            "auxiliary_transform": "identity" if auxiliary_enabled else None,
+            "auxiliary_label_coverage": None, "auxiliary_scaler": None,
+            "best_auxiliary_validation_loss": best_auxiliary_loss,
+            "loss_formula": "primary weighted mean + auxiliary_weight * observed auxiliary mean",
             "target_space": "caller-supplied fitting space; Cd is already logCd",
             "loss_units": "standardized fitting targets", "symmetry": self.symmetry_,
             "learning_rate_init": float(self.learning_rate_init), "weight_decay": float(self.weight_decay),
@@ -331,11 +456,27 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             "n_raw_features": self.n_features_in_, "n_network_features": x_train.shape[1],
             "history": history, "history_truncated": epoch > len(history),
         }
+        if auxiliary_enabled:
+            coverage = {}
+            for name, values in (("train", auxiliary_train), ("validation", auxiliary_val)):
+                observed = values[np.isfinite(values)].astype(np.float64)
+                coverage[name] = {
+                    "n_rows": len(values), "n_observed": len(observed), "n_missing": len(values) - len(observed),
+                    "fraction_observed": len(observed) / len(values),
+                    "min": float(observed.min()) if len(observed) else None,
+                    "max": float(observed.max()) if len(observed) else None,
+                    "mean": float(observed.mean()) if len(observed) else None,
+                }
+            self.training_metadata_["auxiliary_label_coverage"] = coverage
+            self.training_metadata_["auxiliary_scaler"] = {
+                "mean": float(self.auxiliary_scaler_.mean_[0]), "scale": float(self.auxiliary_scaler_.scale_[0]),
+                "var": float(self.auxiliary_scaler_.var_[0]), "n_samples_seen": int(self.auxiliary_scaler_.n_samples_seen_),
+            }
         print(f"TorchMLP stopped: {stop_reason}; epochs={epoch}, best_epoch={self.best_epoch_}, "
               f"best_validation_loss={best_loss:.7g}; restored best checkpoint; device={device}", flush=True)
         return self
 
-    def _numpy_forward(self, raw):
+    def _latent_prediction(self, raw):
         values = ((raw - self.input_scaler_.mean_.astype(np.float32))
                   / self.input_scaler_.scale_.astype(np.float32))
         for index, (weight, bias) in enumerate(zip(self.coefs_, self.intercepts_)):
@@ -343,6 +484,10 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             if index < len(self.coefs_) - 1:
                 # Stable beta=1 SiLU, including large negative extrapolations.
                 values = values * np.exp(-np.logaddexp(np.float32(0), -values))
+        return values
+
+    def _numpy_forward(self, raw):
+        values = self._latent_prediction(raw)[:, :self.n_outputs_]
         return values * self.target_scaler_.scale_.astype(np.float32) + self.target_scaler_.mean_.astype(np.float32)
 
     def predict(self, X):
@@ -358,6 +503,24 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             prediction[start:start + len(batch)] = values
         if not np.isfinite(prediction).all():
             raise ValueError("Predictions are nonfinite; inputs exceed the model's float32 numerical range.")
+        return prediction
+
+    def predict_auxiliary(self, X):
+        """Return identity-space Cdp with shape (n, 1), using portable weights."""
+        check_is_fitted(self, ("coefs_", "intercepts_", "input_scaler_", "auxiliary_scaler_", "symmetry_"))
+        raw = self._feature_array(X, self.feature_names_in_)
+        prediction = np.empty((len(raw), 1), dtype=np.float32)
+        for start in range(0, len(raw), self.batch_size):
+            batch = raw[start:start + self.batch_size]
+            values = self._latent_prediction(batch)[:, self.n_outputs_:]
+            if self.symmetry_:
+                # Cdp is even: averaging normalized outputs preserves its offset.
+                values = 0.5 * (values + self._latent_prediction(batch * self.reflection_signs_)[:, self.n_outputs_:])
+            prediction[start:start + len(batch)] = (
+                values * self.auxiliary_scaler_.scale_.astype(np.float32) + self.auxiliary_scaler_.mean_.astype(np.float32)
+            )
+        if not np.isfinite(prediction).all():
+            raise ValueError("Auxiliary predictions are nonfinite; inputs exceed the model's float32 numerical range.")
         return prediction
 
 

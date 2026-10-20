@@ -138,3 +138,14 @@ def test_assemble_rejects_a_non_numeric_or_missing_feature(tables):
         assemble_features(polars, geometry.assign(max_thickness=["a", "b"]))
     with pytest.raises(ValueError, match="NaN or infinite"):
         assemble_features(polars, geometry.assign(area=[1.0, np.nan]))
+
+
+def test_auxiliary_labels_and_missingness_never_change_the_feature_matrix(tables):
+    geometry, polars = tables
+    original, names = assemble_features(polars, geometry)
+    enriched, enriched_names = assemble_features(
+        polars.assign(Cdp=[-.001, np.nan, .02], Cdp_observed=[True, False, True]), geometry,
+    )
+    assert enriched_names == names
+    assert not {"Cdp", "Cdp_observed"}.intersection(names)
+    pd.testing.assert_frame_equal(enriched[names], original[names])

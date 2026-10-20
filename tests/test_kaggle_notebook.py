@@ -93,6 +93,51 @@ def test_setup_cell_targets_kaggle_paths_not_drive(cells):
     assert "/kaggle/input" in cells["v2-config"]
 
 
+def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, kaggle_inputs, monkeypatch):
+    from src.data import auxiliary
+    from src.training import comparison
+
+    data_dir, root = kaggle_inputs
+    polars_path = data_dir / "airfoil_polars.csv"
+    original_bytes = polars_path.read_bytes()
+    keys = ["geometry_id", "Alpha", "Re", "Ncrit"]
+    sidecar = pd.read_csv(polars_path)[keys].assign(Cdp=np.arange(210) * .001, Cdp_observed=True)
+    # Deliberately reorder labels to require an identity-based, not positional, join.
+    monkeypatch.setattr(auxiliary, "load_auxiliary", lambda *args: sidecar.iloc[::-1])
+    (data_dir / "auxiliary_report.json").write_text(json.dumps({"sidecar_sha256": "d" * 64}))
+    original_loader = comparison.load_frozen_split
+
+    class Protected(pd.DataFrame):
+        def __getitem__(self, key):
+            if isinstance(key, list) and any(name not in keys for name in key):
+                pytest.fail("Production holdout feature/target matrices must wait for the development decision")
+            return super().__getitem__(key)
+
+    def loader(*args, **kwargs):
+        split, features, targets, metadata = original_loader(*args, **kwargs)
+        split.validation, split.test = Protected(split.validation), Protected(split.test)
+        return split, features, targets, metadata
+    monkeypatch.setattr(comparison, "load_frozen_split", loader)
+    namespace = {
+        "DATA_DIR": data_dir, "POLARS_PATH": polars_path,
+        "GEOMETRY_PATH": data_dir / "airfoil_geometry.csv",
+        "FROZEN_SPLIT": root / "configs" / "frozen_split.json",
+        "KAGGLE_STUDY_MODE": "auxiliary",
+    }
+    exec(compile(cells["v2-data"], "kaggle:auxiliary-data", "exec"), namespace)
+    assert not {"X_train", "X_validation", "y_train", "y_validation"}.intersection(namespace)
+    assert len(namespace["feature_columns"]) == 113
+    assert not {"Cdp", "Cdp_observed"}.intersection(namespace["feature_columns"])
+    assert namespace["dataset_metadata"]["auxiliary"] == {"sidecar_sha256": "d" * 64}
+    assert "auxiliary" not in namespace["dataset_metadata"]["dataset"]
+    for partition in ("train", "validation", "test"):
+        frame = getattr(namespace["split"], partition)
+        np.testing.assert_array_equal(frame.Cdp, sidecar.set_index(keys).loc[
+            pd.MultiIndex.from_frame(frame[keys]), "Cdp"].to_numpy())
+        assert frame.Cdp_observed.all()
+    assert polars_path.read_bytes() == original_bytes
+
+
 @pytest.mark.parametrize("accelerator,cuda_available", [("gpu", False), ("gpu", True), ("cpu", False)])
 def test_bundled_setup_skips_git_and_records_actual_gpu(
     cells, tmp_path, monkeypatch, accelerator, cuda_available,

@@ -466,11 +466,80 @@ Production choices are frozen before canonical test evaluation. The intentionall
 exposed arm never influences production selection. A three-seed study measures
 initialization variability on this split; it does not replace new geometry folds.
 
+### Cdp auxiliary study
+
+The next experiment takes the additional `Cdp` target from
+[NASA's training code](https://github.com/nasa/airfoil-learning/blob/f211e62fab6be125657d49c58fdce1bdeb0d12a8/pytorch/train_dnn.py),
+not its row-random split or full-data scaling. It compares our unchanged three-output
+Huber model against the same model with an internal auxiliary Cdp head.
+
+The audited sidecar covers **all 768,542 existing rows**, with no duplicate keys,
+unmatched operating points, missing labels, or imputation. Two Cdp values are
+negative (minimum -0.00108), so the auxiliary target uses **identity space**, not
+a logarithm. `Cd - Cdp` is positive throughout the audited data. This is a label
+consistency check, not a guarantee of XFOIL accuracy on extreme geometries.
+
+```bash
+python -m src.data.auxiliary
+python -m src.utils.kaggle_sync push <owner>/<new-cdp-dataset> --create --include-auxiliary
+python -m src.utils.kaggle_sync kernel <owner>/<cdp-study> --dataset <owner>/<new-cdp-dataset> --accelerator gpu --auxiliary-study
+```
+
+Use a **separate dataset**, leaving the original two tables, their hashes, and the
+pinned reference untouched. The optional upload adds only `airfoil_auxiliary.csv`
+and `auxiliary_report.json`. Dataset and source staging reject nonempty destinations;
+personal reports, credentials and raw archives are excluded by explicit allowlists,
+not merely by `.gitignore`.
+
+The fixed experiment consists of **12 fits**, with clear phase/seed/arm progress:
+
+- Six development fits: baseline versus auxiliary weight 0.1, seeds 42/43/44.
+  Only canonical training geometries are partitioned into fit, stopping, and
+  evaluation sets (80/10/10; partition seed 20261020).
+- A development-only eligibility decision is saved before production validation
+  or test scoring. No best-seed selection is allowed.
+- Six confirmation fits: both predeclared arms and all three seeds on the full
+  canonical training partition, with the original validation set for stopping.
+  Test results audit the frozen decision; they never rewrite it.
+
+Cdp is a **label only** and never joins the 113 input features. The public predictor
+still returns Cl, Cd and Cm; auxiliary predictions are separate. The baseline trunk,
+primary-head initialization, primary target scalers, and primary loss denominator
+are preserved. With H denoting Huber loss in training-standardized target units:
+
+```text
+primary loss = (H(Cl) + 2 H(log(Cd)) + 0.5 H(Cm)) / 3.5
+auxiliary training loss = primary loss + 0.1 H(Cdp)
+```
+
+Only observed auxiliary labels contribute. Scheduling and stopping monitor the
+**same primary validation loss** for both arms; improving Cdp alone cannot extend
+training or select a checkpoint. The 0.1 weight is a declared experiment choice,
+not a numerical ratio claimed by NASA.
+
+The new paired development gate supplements the original median-only CI guard:
+
+- Mean median relative error may worsen by at most 0.5 percentage points for each
+  primary target; mean drag median error must improve.
+- Mean physical Cd RMSE, p95 and worst-airfoil RMSE, and low-Re/thick-airfoil stress
+  RMSE may worsen by at most 5%.
+- Each paired seed's pooled and worst-airfoil Cd RMSE may worsen by at most 10%.
+- Stress boundaries come only from fitting data: the lowest observed Re and the
+  90th percentile of unique-airfoil thickness. Missing stress evidence or incomplete
+  seeds make a gate inconclusive, never a pass.
+
+These tolerances are **predeclared engineering policies**, not statistical confidence
+limits or physical guarantees. A failure retains the baseline as the development
+choice; neither a passing gate nor the experiment automatically changes production
+defaults. The existing test has already been inspected, so confirmation is not a
+new blind benchmark. New accuracy gains remain unclaimed until cloud verification.
+
 ### Testing
 
 ```bash
 python -m pytest tests/test_kaggle_sync.py tests/test_kaggle_notebook.py tests/test_analysis.py tests/test_torch_mlp.py -m 'not gpu'
 python -m pytest tests/test_accuracy_guard.py tests/test_study.py
+python -m pytest tests/test_auxiliary.py tests/test_tail_risk.py tests/test_auxiliary_study.py
 ```
 
 The full suite, including model fitting, runs in the Kaggle notebook preflight. The

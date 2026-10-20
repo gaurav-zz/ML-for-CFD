@@ -201,6 +201,81 @@ def test_cli_zero_exit_push_error_is_not_reported_as_success():
         kaggle_sync._run(["kaggle", "kernels", "push", "-p", "/unused"], runner)
 
 
+def test_auxiliary_upload_is_opt_in_and_excludes_personal_files(tmp_path):
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    for name in (*PUSH_FILES, *kaggle_sync.AUXILIARY_PUSH_FILES):
+        (processed / name).write_text("test data\n")
+    for name in ("Minor_Project_Progress_Report.docx", "private.pdf", "raw.zip", "kaggle.json"):
+        (processed / name).write_text("PRIVATE DECOY")
+    ordinary = stage_dataset("me/data", tmp_path / "ordinary", processed)
+    assert {path.name for path in ordinary.iterdir()} == {*PUSH_FILES, "dataset-metadata.json"}
+    auxiliary = stage_dataset("me/data", tmp_path / "auxiliary", processed, include_auxiliary=True)
+    assert {path.name for path in auxiliary.iterdir()} == {
+        *PUSH_FILES, *kaggle_sync.AUXILIARY_PUSH_FILES, "dataset-metadata.json",
+    }
+
+
+def test_source_snapshot_cannot_include_reports_or_raw_data(tmp_path):
+    import ast
+    import base64
+    import io
+    import zipfile
+
+    root = tmp_path / "source"
+    (root / "src" / "training").mkdir(parents=True)
+    (root / "src" / "training" / "comparison.py").write_text("# source only\n")
+    for relative in ("Minor_Project_Progress_Report.docx", "docs/Minor_Project_Progress_Report.docx",
+                     "results/report.pdf", "data/raw/private.zip", ".kaggle/kaggle.json"):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("PRIVATE DECOY")
+    cell = kaggle_sync._source_cell(root, "gpu", study_mode="auxiliary")
+    syntax = ast.parse("".join(cell["source"]))
+    assignment = next(node for node in syntax.body if isinstance(node, ast.Assign)
+                      and node.targets[0].id == "_source_archive")
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(ast.literal_eval(assignment.value.args[0])))) as archive:
+        assert archive.namelist() == ["src/training/comparison.py"]
+
+
+@pytest.mark.parametrize("kind", ["dataset", "kernel"])
+def test_staging_refuses_preexisting_private_content(tmp_path, kind):
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    private = staging / "Minor_Project_Progress_Report.docx"
+    private.write_text("PRIVATE DECOY")
+    if kind == "kernel":
+        operation = lambda: stage_kernel("me/run", "me/data", staging)
+    else:
+        processed = tmp_path / "processed"
+        processed.mkdir()
+        for name in PUSH_FILES:
+            (processed / name).write_text("test\n")
+        operation = lambda: stage_dataset("me/data", staging, processed)
+    with pytest.raises(ValueError, match="must be empty"):
+        operation()
+    assert private.read_text() == "PRIVATE DECOY"
+
+
+def test_auxiliary_study_entrypoint_is_distinct_and_holdouts_are_deferred(tmp_path):
+    staged = stage_kernel("me/run", "me/data", tmp_path / "stage", auxiliary_study=True)
+    document = json.loads((staged / "v2_experiment_kaggle.ipynb").read_text())
+    cells = {cell["id"]: "".join(cell["source"]) for cell in document["cells"]}
+    assert "KAGGLE_STUDY_MODE = 'auxiliary'" in cells["kaggle-source-bundle"]
+    assert "run_auxiliary_study(split, feature_columns, target_columns, RUN_OUTPUT" in cells["v2-train"]
+    assert "run_study(" not in cells["v2-train"]
+    assert "test-results" not in cells
+    assert "Cdp attached as a label only" in cells["v2-data"]
+    assert "6 development fits, then 6 confirmation fits" in cells["v2-queue"]
+    assert "training-only development tail gates" in cells["v2-queue"]
+    assert "MODEL_CONFIGS" not in cells["v2-queue"]
+    for cell in document["cells"]:
+        if cell["cell_type"] == "code":
+            compile("".join(cell["source"]), cell["id"], "exec")
+    with pytest.raises(ValueError, match="not both"):
+        stage_kernel("me/run", "me/data", tmp_path / "invalid", study=True, auxiliary_study=True)
+
+
 def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
     import ast
     import base64

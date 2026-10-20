@@ -6,9 +6,9 @@ keeps as the kernel's output. The round trip is therefore explicit: push the
 processed tables as a dataset version, run the notebook, then pull the kernel
 output back into ``results/kaggle/<run-id>/``.
 
-Only the two processed tables and their load report are ever pushed -- about
-57 MB. The 1.5 GB raw archive stays local, and model weights stay on Kaggle
-unless you ask for them.
+Only explicitly allowlisted processed tables and reports are pushed. Auxiliary
+labels require an opt-in; raw archives, personal reports, and credentials never
+enter the dataset or source snapshot.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import zipfile
 from src.data.loaders import GEOMETRY_TABLE, LOAD_REPORT, POLARS_TABLE
 
 PUSH_FILES = (GEOMETRY_TABLE, POLARS_TABLE, LOAD_REPORT)
+AUXILIARY_PUSH_FILES = ("airfoil_auxiliary.csv", "auxiliary_report.json")
 DEFAULT_PROCESSED = Path(__file__).resolve().parents[2] / "data" / "processed"
 DEFAULT_RESULTS = Path(__file__).resolve().parents[2] / "results" / "kaggle"
 DEFAULT_SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -74,7 +75,8 @@ def _run(command: list[str], runner=subprocess.run) -> str:
     return output
 
 
-def stage_dataset(dataset: str, staging_dir: Path, processed_dir: Path = DEFAULT_PROCESSED) -> Path:
+def stage_dataset(dataset: str, staging_dir: Path, processed_dir: Path = DEFAULT_PROCESSED,
+                  *, include_auxiliary: bool = False) -> Path:
     """Copy just the pushable files into a clean folder with Kaggle metadata.
 
     Staging matters: ``kaggle datasets version`` uploads a whole directory, and
@@ -82,13 +84,16 @@ def stage_dataset(dataset: str, staging_dir: Path, processed_dir: Path = DEFAULT
     """
     _reference(dataset, "dataset")
     processed_dir, staging_dir = Path(processed_dir), Path(staging_dir)
-    missing = [name for name in PUSH_FILES if not (processed_dir / name).is_file()]
+    files = PUSH_FILES + (AUXILIARY_PUSH_FILES if include_auxiliary else ())
+    missing = [name for name in files if not (processed_dir / name).is_file()]
     if missing:
         raise FileNotFoundError(
             f"Missing {missing} in {processed_dir}. Run `python -m src.data.loaders` first."
         )
+    if staging_dir.exists() and any(staging_dir.iterdir()):
+        raise ValueError("Dataset staging directory must be empty; unrelated files must not be uploaded.")
     staging_dir.mkdir(parents=True, exist_ok=True)
-    for name in PUSH_FILES:
+    for name in files:
         shutil.copy2(processed_dir / name, staging_dir / name)
     (staging_dir / "dataset-metadata.json").write_text(
         json.dumps(
@@ -111,6 +116,7 @@ def push_tables(
     message: str | None = None,
     create: bool = False,
     runner=subprocess.run,
+    *, include_auxiliary: bool = False,
 ) -> str:
     """Upload the processed tables as a new dataset version.
 
@@ -119,7 +125,7 @@ def push_tables(
     staging = Path(processed_dir) / ".kaggle-upload"
     shutil.rmtree(staging, ignore_errors=True)
     try:
-        stage_dataset(dataset, staging, processed_dir)
+        stage_dataset(dataset, staging, processed_dir, include_auxiliary=include_auxiliary)
         if create:
             command = ["kaggle", "datasets", "create", "-p", str(staging), "--dir-mode", "skip"]
         else:
@@ -131,7 +137,8 @@ def push_tables(
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _source_cell(source_root: Path, accelerator: str, machine_shape: str | None = None) -> dict:
+def _source_cell(source_root: Path, accelerator: str, machine_shape: str | None = None,
+                 study_mode: str = "accuracy") -> dict:
     """Embed an allowlisted source snapshot, never data, credentials, or weights."""
     root = Path(source_root)
     files = [*root.glob("src/**/*.py"), *root.glob("tests/**/*.py")]
@@ -164,6 +171,7 @@ def _source_cell(source_root: Path, accelerator: str, machine_shape: str | None 
         "import base64, hashlib, io, tempfile, zipfile\n"
         f"KAGGLE_ACCELERATOR = {accelerator!r}\n"
         f"KAGGLE_MACHINE_SHAPE = {machine_shape!r}\n"
+        f"KAGGLE_STUDY_MODE = {study_mode!r}\n"
         f"BUNDLED_SOURCE_SHA256 = {digest!r}\n"
         f"BUNDLED_GIT_REVISION = {revision!r}\n"
         f"_source_archive = base64.b64decode({base64.b64encode(contents).decode('ascii')!r})\n"
@@ -191,6 +199,7 @@ def stage_kernel(
     machine_shape: str | None = None,
     source_root: Path = DEFAULT_SOURCE_ROOT,
     study: bool = False,
+    auxiliary_study: bool = False,
 ) -> Path:
     """Write the notebook and its ``kernel-metadata.json`` into a clean folder.
 
@@ -203,12 +212,25 @@ def stage_kernel(
         raise ValueError("accelerator must be 'gpu' or 'cpu'.")
     if machine_shape and accelerator != "gpu":
         raise ValueError("machine_shape requires the GPU accelerator.")
+    if study and auxiliary_study:
+        raise ValueError("Choose either the original controlled study or the auxiliary study, not both.")
     notebook, staging_dir = Path(notebook), Path(staging_dir)
     if not notebook.is_file():
         raise FileNotFoundError(f"Notebook not found: {notebook}")
+    if staging_dir.exists() and any(staging_dir.iterdir()):
+        raise ValueError("Kernel staging directory must be empty; unrelated files must not be uploaded.")
     staging_dir.mkdir(parents=True, exist_ok=True)
     document = json.loads(notebook.read_text(encoding="utf-8"))
-    if study:
+    if auxiliary_study:
+        queue = next((cell for cell in document["cells"] if cell.get("id") == "v2-queue"), None)
+        if queue is None:
+            raise ValueError("Auxiliary study mode requires the v2-queue notebook cell.")
+        queue["source"] = [
+            "print('Cdp auxiliary study: 6 development fits, then 6 confirmation fits.')\n",
+            "print('Paired seeds 42/43/44: unchanged Huber baseline versus auxiliary weight 0.1.')\n",
+            "print('Decisions use training-only development tail gates; test is an audit only.')\n",
+        ]
+    if study or auxiliary_study:
         # Reuse bootstrap/preflight/data loading, but let the study orchestrator
         # freeze all choices before evaluation. Never run the ordinary test cells.
         train_index = next((i for i, cell in enumerate(document["cells"])
@@ -220,16 +242,18 @@ def stage_kernel(
         marker = "validation_results = compare_models("
         if marker not in source:
             raise ValueError("Study mode could not locate the standard training entry point.")
+        module, function = ("auxiliary_study", "run_auxiliary_study") if auxiliary_study else ("study", "run_study")
         source = source.split(marker, 1)[0] + (
-            "from src.training.study import run_study\n"
-            "run_study(split, feature_columns, target_columns, RUN_OUTPUT,\n"
+            f"from src.training.{module} import {function}\n"
+            f"{function}(split, feature_columns, target_columns, RUN_OUTPUT,\n"
             "          run_metadata=run_metadata,\n"
             "          device='cuda' if ACCELERATOR == 'gpu' else 'cpu')\n"
             "print(f'Controlled study artifacts: {RUN_OUTPUT}')\n"
         )
         cell["source"] = source.splitlines(keepends=True)
         document["cells"] = document["cells"][:train_index + 1]
-    document["cells"].insert(0, _source_cell(source_root, accelerator, machine_shape))
+    mode = "auxiliary" if auxiliary_study else "controlled" if study else "accuracy"
+    document["cells"].insert(0, _source_cell(source_root, accelerator, machine_shape, mode))
     (staging_dir / notebook.name).write_text(
         json.dumps(document, indent=1) + "\n", encoding="utf-8",
     )
@@ -275,11 +299,12 @@ def push_kernel(
     machine_shape: str | None = None,
     source_root: Path = DEFAULT_SOURCE_ROOT,
     study: bool = False,
+    auxiliary_study: bool = False,
 ) -> str:
     """Upload the notebook and queue a run.
 
     Pushing *is* what starts execution on Kaggle: there is no separate run verb.
-    Pushing an existing slug replaces that notebook and runs it again.
+    Pushing creates another version; it does not cancel older active versions.
 
     The dataset is checked for readiness first. Kaggle accepts a
     ``dataset_sources`` entry for a dataset whose first version is still
@@ -298,7 +323,7 @@ def push_kernel(
         stage_kernel(
             kernel, dataset, staging, notebook, private, accelerator=accelerator,
             machine_shape=machine_shape, source_root=source_root,
-            study=study,
+            study=study, auxiliary_study=auxiliary_study,
         )
         return _run(["kaggle", "kernels", "push", "-p", str(staging)], runner)
     finally:
@@ -353,13 +378,16 @@ def main() -> None:
     push.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED)
     push.add_argument("-m", "--message", help="Version note recorded on Kaggle.")
     push.add_argument("--create", action="store_true", help="Create the dataset for the first time.")
+    push.add_argument("--include-auxiliary", action="store_true", help="Also upload the audited Cdp sidecar and report.")
 
     kernel = subcommands.add_parser("kernel", help="Upload the notebook and queue a run.")
     kernel.add_argument("kernel", help="Kaggle kernel ref, e.g. yourname/airfoil-v2-experiment.")
     kernel.add_argument("--dataset", required=True, help="Tables dataset to attach as input.")
     kernel.add_argument("--notebook", type=Path, default=DEFAULT_NOTEBOOK)
     kernel.add_argument("--accelerator", choices=("gpu", "cpu"), default="gpu")
-    kernel.add_argument("--study", action="store_true", help="Run the controlled seed, loss-sweep, and leakage study.")
+    mode = kernel.add_mutually_exclusive_group()
+    mode.add_argument("--study", action="store_true", help="Run the controlled seed, loss-sweep, and leakage study.")
+    mode.add_argument("--auxiliary-study", action="store_true", help="Run paired Cdp supervision with development-only tail gates.")
     kernel.add_argument(
         "--machine-shape", help="Optional Kaggle GPU type, e.g. NvidiaTeslaT4 or NvidiaL4.",
     )
@@ -378,13 +406,15 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.command == "push":
-            output = push_tables(args.dataset, args.processed_dir, args.message, args.create)
-            print(output.strip() or f"Pushed {list(PUSH_FILES)} to {args.dataset}.")
+            output = push_tables(args.dataset, args.processed_dir, args.message, args.create,
+                                 include_auxiliary=args.include_auxiliary)
+            files = PUSH_FILES + (AUXILIARY_PUSH_FILES if args.include_auxiliary else ())
+            print(output.strip() or f"Pushed {list(files)} to {args.dataset}.")
         elif args.command == "kernel":
             output = push_kernel(
                 args.kernel, args.dataset, args.notebook, private=not args.public,
                 accelerator=args.accelerator, machine_shape=args.machine_shape,
-                study=args.study,
+                study=args.study, auxiliary_study=args.auxiliary_study,
             )
             print(output.strip() or f"Pushed {args.notebook.name} to {args.kernel}.")
             print(f"Track it with: python -m src.utils.kaggle_sync status {args.kernel}")
