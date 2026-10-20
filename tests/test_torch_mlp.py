@@ -259,7 +259,10 @@ def test_baseline_known_primary_subsets_remain_supported(target_names):
     model._validate_params()
     prediction = model.predict(frame)
     assert prediction.shape == (len(frame), len(target_names))
-    np.testing.assert_array_equal(model.predict(_reflect(frame)), prediction * model.target_signs_)
+    # Equivalent float32 computations need not be bit-identical across BLAS
+    # kernels/layouts. This checks mathematical parity, not serialization.
+    np.testing.assert_allclose(model.predict(_reflect(frame)), prediction * model.target_signs_,
+                               rtol=2e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize("symmetry", [True, False])
@@ -279,7 +282,8 @@ def test_auxiliary_portable_head_is_separate_signed_and_even(symmetry):
         reflected = model._latent_prediction(raw * model.reflection_signs_)[:, 3:]
         reflected = reflected * model.auxiliary_scaler_.scale_ + model.auxiliary_scaler_.mean_
         direct = 0.5 * (direct + reflected)
-        np.testing.assert_array_equal(model.predict_auxiliary(_reflect(frame)), prediction)
+        np.testing.assert_allclose(model.predict_auxiliary(_reflect(frame)), prediction,
+                                   rtol=2e-6, atol=1e-7)
     np.testing.assert_allclose(prediction, direct, rtol=2e-6, atol=1e-7)
     # Cdp decoding is identity, not exp/clipping, and retains the nonzero offset.
     model.coefs_[-1][-1] = 0
@@ -505,7 +509,8 @@ def test_kaggle_cuda_cap_checkpoint_scalers_and_portable_roundtrip(loss, symmetr
         )
         np.testing.assert_allclose(elements.mean(), metadata["best_auxiliary_validation_loss"], rtol=2e-5, atol=2e-6)
         if symmetry:
-            np.testing.assert_array_equal(model.predict_auxiliary(_reflect(val)), auxiliary_prediction)
+            np.testing.assert_allclose(model.predict_auxiliary(_reflect(val)), auxiliary_prediction,
+                                       rtol=2e-6, atol=1e-7)
     else:
         assert metadata["auxiliary_name"] is None
         assert metadata["auxiliary_scaler"] is None
@@ -591,7 +596,11 @@ def test_kaggle_best_checkpoint_is_not_last_epoch(auxiliary_weight, kaggle_cuda,
         combined = [row["validation_loss"] + auxiliary_weight * row["validation_auxiliary_loss"] for row in history]
         assert np.all(np.diff(combined) < 0)
         assert model.intercepts_[-1][-1] == 997
-        assert model.training_metadata_["best_auxiliary_validation_loss"] == 997 ** 2
+        # CUDA's float32 mean reduction may differ from the exact integer by
+        # one ULP (observed 994009.0625 versus 994009); checkpoint values above
+        # remain exact, so a wrong epoch cannot pass this tolerance.
+        np.testing.assert_allclose(model.training_metadata_["best_auxiliary_validation_loss"],
+                                   997 ** 2, rtol=2 * np.finfo(np.float32).eps, atol=0)
 
 
 @pytest.mark.gpu
