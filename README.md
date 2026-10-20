@@ -13,11 +13,11 @@ evaluation protocol are prerequisites; accuracy improvements still require measu
 
 ## Status
 
-**Latest:** the 12-fit controlled study completed on 19 October 2026. Huber improves
-median error across all three seeds, but drag extrapolation is unstable. The
-validation-selected no-weight-decay trial is **not an overall accuracy upgrade**:
-its slightly better median conceals substantially worse RMSE. Defaults and the
-pinned CPU reference have not been changed.
+**Latest (20 October 2026):** the NASA-inspired Cdp auxiliary study completed all
+12 fits. It passed the training-only development gate, but **failed the frozen test
+tail audit**: average drag RMSE improved, while p95 airfoil error and seed 43's drag
+errors exceeded the predeclared limits. The auxiliary model is not promoted.
+Defaults and the pinned CPU reference remain unchanged.
 
 The completed Kaggle CPU run (`20261018T115938507650Z`) and automatic-GPU run
 (`20261018T121854085520Z`) both selected **Torch Huber** on validation for all three
@@ -468,7 +468,7 @@ initialization variability on this split; it does not replace new geometry folds
 
 ### Cdp auxiliary study
 
-The next experiment takes the additional `Cdp` target from
+This completed experiment takes the additional `Cdp` target from
 [NASA's training code](https://github.com/nasa/airfoil-learning/blob/f211e62fab6be125657d49c58fdce1bdeb0d12a8/pytorch/train_dnn.py),
 not its row-random split or full-data scaling. It compares our unchanged three-output
 Huber model against the same model with an internal auxiliary Cdp head.
@@ -514,7 +514,8 @@ auxiliary training loss = primary loss + 0.1 H(Cdp)
 
 Only observed auxiliary labels contribute. Scheduling and stopping monitor the
 **same primary validation loss** for both arms; improving Cdp alone cannot extend
-training or select a checkpoint. The 0.1 weight is a declared experiment choice,
+training or select a checkpoint. Auxiliary validation loss is logged diagnostically,
+not used for stopping or eligibility. The 0.1 weight is a declared experiment choice,
 not a numerical ratio claimed by NASA.
 
 The new paired development gate supplements the original median-only CI guard:
@@ -532,7 +533,76 @@ These tolerances are **predeclared engineering policies**, not statistical confi
 limits or physical guarantees. A failure retains the baseline as the development
 choice; neither a passing gate nor the experiment automatically changes production
 defaults. The existing test has already been inspected, so confirmation is not a
-new blind benchmark. New accuracy gains remain unclaimed until cloud verification.
+new blind benchmark.
+
+**Measured outcome:** run `20261020T104928953059Z` completed all 12 fits on a Tesla
+T4 in approximately 26 minutes. Cloud preflight passed **704 tests** (six skipped,
+one deselected). The successful notebook source is `07142df`; the earlier precision
+assertion and notebook-path failures occurred before study fitting and did not
+change the model settings, data, or gate thresholds.
+
+On the 57-airfoil training-only development evaluation, mean median errors were:
+
+| target | baseline | with Cdp |
+|---|---|---|
+| `Cl` | 8.797% | 7.597% |
+| `Cd` | 11.510% | 8.976% |
+| `Cm` | 24.265% | 19.971% |
+
+Mean development Cd RMSE decreased from 0.01491 to 0.01091, and all development
+checks passed. `auxiliary_selection.json` therefore froze the Cdp arm **before**
+canonical validation or test scoring. This decision has not been rewritten.
+
+The full-data confirmation results are the mean and sample standard deviation of
+test median relative error across seeds 42/43/44, in percent:
+
+| target | baseline | with Cdp |
+|---|---|---|
+| `Cl` | 3.834 +/- 0.017% | 3.790 +/- 0.011% |
+| `Cd` | 5.612 +/- 0.065% | 5.550 +/- 0.094% |
+| `Cm` | 10.124 +/- 0.451% | 10.022 +/- 0.357% |
+
+The three confirmation baselines reproduce the prior GPU Huber run's 45 reported
+test scores and stored weights/scalers exactly. Recomputed development and test
+gates also match the saved decisions, supporting the intended paired comparison.
+
+Average Cd RMSE decreased from **0.02290 to 0.01407**, helped substantially by
+correcting the previous seed-44 failure. The worst of the three seed-level Cd RMSEs
+also improved, from 0.04159 to 0.02133. However, paired improvement was not uniform:
+
+| seed | baseline Cd RMSE | Cdp Cd RMSE | baseline Cd R² | Cdp Cd R² |
+|---|---|---|---|---|
+| 42 | 0.01157 | 0.00908 | 0.8760 | 0.9237 |
+| 43 | 0.01553 | 0.02133 | 0.7766 | 0.5784 |
+| 44 | 0.04159 | 0.01180 | -0.6021 | 0.8710 |
+
+The paired test-tail audit failed three unchanged limits:
+
+- Mean p95 airfoil Cd RMSE increased from **0.01227 to 0.01313**, about **7.1%**,
+  exceeding the 5% allowance.
+- Seed 43's pooled Cd RMSE increased about **37.4%**, exceeding the 10% allowance.
+- Seed 43's worst-airfoil Cd RMSE increased from **0.14714 to 0.21420**, about
+  **45.6%**, exceeding the 10% allowance.
+
+Mean Cl RMSE also increased from 0.10781 to 0.12292, and mean Cm RMSE from 0.01472
+to 0.01647. Those regressions must not be hidden behind slightly better medians.
+The original median-only guard passes the predeclared seed-42 Cdp candidate against
+the pinned CPU reference (Cl -0.0223 pp, Cd +0.0763 pp, Cm +0.0276 pp), but that does
+not override the failed paired tail audit.
+
+**Decision:** retain the existing baseline; do not promote the auxiliary model or
+select a favorable seed. Cdp supervision is promising on average, but this result
+does not meet our predeclared reliability criteria. This was one development
+geometry partition with three initialization seeds, not three geometry folds.
+The next priority is additional training-only geometry folds and validation of
+seed-disagreement/ensemble behavior, not relaxing the limits or tuning on the
+known test failures. No further training sweep was automatically launched.
+
+Evidence is preserved under
+`results/kaggle/cdp-study-v3/experiments/v2/20261020T104928953059Z/`, including the
+immutable selection, all per-seed reports, `summary.csv`, and `tail_audit.json`.
+The successful source archive SHA256 is
+`4453ecf7c00cef238466d7732b8215990c9902d8a759e89051a35a1ae5999ccf`.
 
 ### Testing
 
