@@ -119,11 +119,15 @@ def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, k
         return split, features, targets, metadata
     monkeypatch.setattr(comparison, "load_frozen_split", loader)
     namespace = {
-        "DATA_DIR": data_dir, "POLARS_PATH": polars_path,
-        "GEOMETRY_PATH": data_dir / "airfoil_geometry.csv",
-        "FROZEN_SPLIT": root / "configs" / "frozen_split.json",
+        "Path": Path, "PROJECT_ROOT": root,
         "KAGGLE_STUDY_MODE": "auxiliary",
     }
+    # Run the real setup chain: injecting dataset variables here concealed a
+    # DATA_DIR typo that the notebook's actual resolver never defines.
+    exec(compile(cells["v2-config"], "kaggle:config", "exec"), namespace)
+    namespace["INPUT_ROOT"] = data_dir.parent
+    exec(compile(cells["v2-resolve"], "kaggle:resolve", "exec"), namespace)
+    assert "DATA_DIR" not in namespace
     exec(compile(cells["v2-data"], "kaggle:auxiliary-data", "exec"), namespace)
     assert not {"X_train", "X_validation", "y_train", "y_validation"}.intersection(namespace)
     assert len(namespace["feature_columns"]) == 113
@@ -136,6 +140,65 @@ def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, k
             pd.MultiIndex.from_frame(frame[keys]), "Cdp"].to_numpy())
         assert frame.Cdp_observed.all()
     assert polars_path.read_bytes() == original_bytes
+
+
+def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(kaggle_inputs, tmp_path, monkeypatch):
+    from importlib import metadata as package_metadata
+
+    from src.data import auxiliary
+    from src.training import auxiliary_study
+    from src.utils.kaggle_sync import stage_kernel
+
+    data_dir, root = kaggle_inputs
+    keys = ["geometry_id", "Alpha", "Re", "Ncrit"]
+    labels = pd.read_csv(data_dir / "airfoil_polars.csv")[keys].assign(Cdp=.01, Cdp_observed=True)
+    (data_dir / "auxiliary_report.json").write_text(json.dumps({"sidecar_sha256": "d" * 64}))
+    seen = []
+
+    def load_labels(sidecar, polars, report):
+        assert sidecar == data_dir / "airfoil_auxiliary.csv"
+        assert polars == data_dir / "airfoil_polars.csv"
+        assert report == data_dir / "auxiliary_report.json"
+        return labels
+
+    def record_study(split, features, targets, output, **kwargs):
+        seen.append((split, features, targets, output, kwargs))
+        return {"status": "mocked: no fitting"}
+
+    monkeypatch.setattr(auxiliary, "load_auxiliary", load_labels)
+    monkeypatch.setattr(auxiliary_study, "run_auxiliary_study", record_study)
+    installed_version = package_metadata.version
+    # Version logging must not require the cloud-only training/plot dependencies
+    # in the minimal fit-free CI environment.
+    monkeypatch.setattr(package_metadata, "version",
+                        lambda name: "mock" if name in {"torch", "matplotlib"} else installed_version(name))
+    staged = stage_kernel("me/study", "me/data", tmp_path / "stage", auxiliary_study=True)
+    document = nbformat.read(staged / NOTEBOOK.name, as_version=4)
+    sources = {cell.id: cell.source for cell in document.cells if cell.cell_type == "code"}
+    # These are the real bootstrap's outputs, not guessed dataset globals.
+    namespace = {
+        "Path": Path, "sys": sys, "PROJECT_ROOT": root,
+        "SOURCE_REVISION": "a" * 40, "SOURCE_SHA256": "b" * 64, "SOURCE_MODE": "bundle",
+        "ACCELERATOR": "gpu", "GPU_TESTS_PASSED": True, "CPU_TESTS_PASSED": False,
+        "GPU_METADATA": {"device_name": "mock GPU"},
+        "torch": SimpleNamespace(__version__="mock", cuda=SimpleNamespace(is_available=lambda: True)),
+    }
+    for statement in ast.parse(sources["kaggle-source-bundle"]).body:
+        if isinstance(statement, ast.Assign) and statement.targets[0].id.startswith("KAGGLE_"):
+            namespace[statement.targets[0].id] = ast.literal_eval(statement.value)
+    exec(compile(sources["v2-config"], "kaggle:config", "exec"), namespace)
+    namespace.update(INPUT_ROOT=data_dir.parent, OUTPUT_ROOT=tmp_path / "working")
+    for name in ("v2-resolve", "v2-data", "v2-queue", "v2-train"):
+        exec(compile(sources[name], f"kaggle:{name}", "exec"), namespace)
+    assert "DATA_DIR" not in namespace
+    assert len(seen) == 1
+    split, features, targets, output, options = seen[0]
+    assert targets == ["Cl", "Cd", "Cm"] and len(features) == 113
+    assert "Cdp" not in features and split.train.Cdp_observed.all()
+    assert options["device"] == "cuda"
+    assert options["run_metadata"]["study_mode"] == "auxiliary"
+    assert options["run_metadata"]["auxiliary"]["sidecar_sha256"] == "d" * 64
+    assert not output.exists(), "The study entrypoint is mocked; no fit/artifact work may occur"
 
 
 @pytest.mark.parametrize("accelerator,cuda_available", [("gpu", False), ("gpu", True), ("cpu", False)])
