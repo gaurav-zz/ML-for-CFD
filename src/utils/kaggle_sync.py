@@ -200,6 +200,7 @@ def stage_kernel(
     source_root: Path = DEFAULT_SOURCE_ROOT,
     study: bool = False,
     auxiliary_study: bool = False,
+    fold_study: bool = False,
 ) -> Path:
     """Write the notebook and its ``kernel-metadata.json`` into a clean folder.
 
@@ -212,8 +213,8 @@ def stage_kernel(
         raise ValueError("accelerator must be 'gpu' or 'cpu'.")
     if machine_shape and accelerator != "gpu":
         raise ValueError("machine_shape requires the GPU accelerator.")
-    if study and auxiliary_study:
-        raise ValueError("Choose either the original controlled study or the auxiliary study, not both.")
+    if sum((study, auxiliary_study, fold_study)) > 1:
+        raise ValueError("Choose only one study mode; study flags cannot be combined.")
     notebook, staging_dir = Path(notebook), Path(staging_dir)
     if not notebook.is_file():
         raise FileNotFoundError(f"Notebook not found: {notebook}")
@@ -221,16 +222,20 @@ def stage_kernel(
         raise ValueError("Kernel staging directory must be empty; unrelated files must not be uploaded.")
     staging_dir.mkdir(parents=True, exist_ok=True)
     document = json.loads(notebook.read_text(encoding="utf-8"))
-    if auxiliary_study:
+    if auxiliary_study or fold_study:
         queue = next((cell for cell in document["cells"] if cell.get("id") == "v2-queue"), None)
         if queue is None:
-            raise ValueError("Auxiliary study mode requires the v2-queue notebook cell.")
+            raise ValueError("Development study mode requires the v2-queue notebook cell.")
         queue["source"] = [
+            "print('Geometry-fold study: 3 folds x 3 seeds x 2 arms = 18 fits.')\n",
+            "print('Ensembles reuse the fold models; seed 42 is the fixed reference, not the best seed.')\n",
+            "print('Only canonical training geometries are used; validation and test are not scored.')\n",
+        ] if fold_study else [
             "print('Cdp auxiliary study: 6 development fits, then 6 confirmation fits.')\n",
             "print('Paired seeds 42/43/44: unchanged Huber baseline versus auxiliary weight 0.1.')\n",
             "print('Decisions use training-only development tail gates; test is an audit only.')\n",
         ]
-    if study or auxiliary_study:
+    if study or auxiliary_study or fold_study:
         # Reuse bootstrap/preflight/data loading, but let the study orchestrator
         # freeze all choices before evaluation. Never run the ordinary test cells.
         train_index = next((i for i, cell in enumerate(document["cells"])
@@ -242,7 +247,9 @@ def stage_kernel(
         marker = "validation_results = compare_models("
         if marker not in source:
             raise ValueError("Study mode could not locate the standard training entry point.")
-        module, function = ("auxiliary_study", "run_auxiliary_study") if auxiliary_study else ("study", "run_study")
+        module, function = (("fold_study", "run_fold_study") if fold_study else
+                            ("auxiliary_study", "run_auxiliary_study") if auxiliary_study else
+                            ("study", "run_study"))
         source = source.split(marker, 1)[0] + (
             f"from src.training.{module} import {function}\n"
             f"{function}(split, feature_columns, target_columns, RUN_OUTPUT,\n"
@@ -252,7 +259,7 @@ def stage_kernel(
         )
         cell["source"] = source.splitlines(keepends=True)
         document["cells"] = document["cells"][:train_index + 1]
-    mode = "auxiliary" if auxiliary_study else "controlled" if study else "accuracy"
+    mode = "folds" if fold_study else "auxiliary" if auxiliary_study else "controlled" if study else "accuracy"
     document["cells"].insert(0, _source_cell(source_root, accelerator, machine_shape, mode))
     (staging_dir / notebook.name).write_text(
         json.dumps(document, indent=1) + "\n", encoding="utf-8",
@@ -300,6 +307,7 @@ def push_kernel(
     source_root: Path = DEFAULT_SOURCE_ROOT,
     study: bool = False,
     auxiliary_study: bool = False,
+    fold_study: bool = False,
 ) -> str:
     """Upload the notebook and queue a run.
 
@@ -323,7 +331,7 @@ def push_kernel(
         stage_kernel(
             kernel, dataset, staging, notebook, private, accelerator=accelerator,
             machine_shape=machine_shape, source_root=source_root,
-            study=study, auxiliary_study=auxiliary_study,
+            study=study, auxiliary_study=auxiliary_study, fold_study=fold_study,
         )
         return _run(["kaggle", "kernels", "push", "-p", str(staging)], runner)
     finally:
@@ -388,6 +396,7 @@ def main() -> None:
     mode = kernel.add_mutually_exclusive_group()
     mode.add_argument("--study", action="store_true", help="Run the controlled seed, loss-sweep, and leakage study.")
     mode.add_argument("--auxiliary-study", action="store_true", help="Run paired Cdp supervision with development-only tail gates.")
+    mode.add_argument("--fold-study", action="store_true", help="Run training-only geometry folds and ensemble evaluation.")
     kernel.add_argument(
         "--machine-shape", help="Optional Kaggle GPU type, e.g. NvidiaTeslaT4 or NvidiaL4.",
     )
@@ -414,7 +423,7 @@ def main() -> None:
             output = push_kernel(
                 args.kernel, args.dataset, args.notebook, private=not args.public,
                 accelerator=args.accelerator, machine_shape=args.machine_shape,
-                study=args.study, auxiliary_study=args.auxiliary_study,
+                study=args.study, auxiliary_study=args.auxiliary_study, fold_study=args.fold_study,
             )
             print(output.strip() or f"Pushed {args.notebook.name} to {args.kernel}.")
             print(f"Track it with: python -m src.utils.kaggle_sync status {args.kernel}")

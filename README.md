@@ -604,12 +604,108 @@ immutable selection, all per-seed reports, `summary.csv`, and `tail_audit.json`.
 The successful source archive SHA256 is
 `4453ecf7c00cef238466d7732b8215990c9902d8a759e89051a35a1ae5999ccf`.
 
+### Geometry-fold and ensemble study
+
+The next bounded experiment uses **only the original 572 training airfoils**.
+Canonical validation and test are checked for identity/coverage but are never
+passed to model fitting, stopping, scoring, or selection in this study.
+
+```bash
+python -m src.utils.kaggle_sync kernel <owner>/<fold-study> --dataset <owner>/<cdp-dataset> --accelerator gpu --fold-study
+```
+
+The existing private Cdp dataset is reused, without uploading the raw archive or
+personal reports. The original 113 features, Huber training settings, and auxiliary
+weight 0.1 remain fixed; this experiment does not add pressure supervision or change
+geometry resolution.
+
+- Three deterministic geometry-ID folds use partition seed 20261026. Evaluation
+  groups contain 191, 191, and 190 airfoils and together cover every training ID.
+- Within each fold, 38 remaining airfoils form a shared stopping set; the inner fit
+  contains 343, 343, or 344 airfoils. Fit/stopping/evaluation are disjoint within a
+  fold. All membership and original row positions are saved before fitting.
+- **18 fresh fits**: three folds x three seeds (42/43/44) x baseline/Cdp arms.
+  Reusing old full-training models here would leak the fold evaluation geometries,
+  so those models are not used. Progress logs show the fold and global fit count.
+- Each fold's three members form an ensemble without extra fitting: arithmetic
+  mean for Cl/Cm, geometric mean for positive Cd. One aggregation rule is declared
+  before evaluation, not chosen by trying different rules on the test set.
+- The fixed reference is **baseline seed 42**, never the best seed. Candidate
+  families are the baseline ensemble and the Cdp ensemble. Eligibility is assessed
+  across all folds; eligible families are ranked by equally weighted mean fold Cd
+  median error, with baseline-ensemble tie preference and seed-42 fallback.
+
+The numerical tolerances remain 0.5 percentage points for mean primary median
+error, 5% for mean Cd tail/stress metrics, and 10% for each fold's pooled/worst-airfoil
+Cd RMSE. Before this experiment, **mean Cl and Cm RMSE are additionally constrained
+to at most 5% deterioration**, to prevent the negative-transfer pattern seen in the
+Cdp study. This is a new fold-study requirement, not a retroactive change to the
+previous study's recorded gate. Fold IDs are not misrepresented as random seeds.
+
+Disagreement is the three-member sample standard deviation in Cl/log(Cd)/Cm.
+Reports compare its rank correlation with observed log-drag error and show all rows
+in fixed low/mid/high spread bins (prediction-only p50/p90 boundaries). This is not
+calibrated uncertainty, a confidence interval, an abstention guarantee, or a reason
+to drop difficult observations. Folds share training data; their variation is
+descriptive and is reported separately from seed variation within each fold.
+
+Outputs include `folds.json`, `fold_rows.csv`, member/ensemble metrics, disagreement
+diagnostics, `gates.json`, and an immutable `fold_selection.json`. Any choice is a
+development recommendation only: fresh full-training fitting and a locked assessment
+would be needed later. Defaults and the pinned reference are not changed, and no
+improvement on the old test set is claimed. This is geometry-ID-held-out evaluation,
+not a guarantee of withholding every related airfoil family.
+
+### Unused-data audit
+
+A non-fitting audit on **training geometries only**, performed on 26 October 2026,
+found all **538,380 training operating points** have finite numeric `Cp_ss` and
+`Cp_ps` arrays, each with 100 entries. They match the stored surface-array lengths.
+All 1,144 training surface coordinate arrays use a common **uniform 100-point x
+grid**, not the cosine grid used by the current model representation. Equal array
+length is not, by itself, evidence of physical consistency with the scalar labels.
+
+The pressure values require further scrutiny before supervision:
+
+| diagnostic flag | training rows | training airfoils |
+|---|---:|---:|
+| any Cp > 2 | 2,408 | 7 |
+| any abs(Cp) > 10 | 12,522 | 324 |
+| any abs(Cp) > 100 | 842 | 1 |
+
+Global training Cp extrema are **-1585.04 and +1451.85**. Values with magnitude above
+10 occur only at stored indices 0 or 1, concentrated at the leading endpoint.
+The most extreme examples belong to training airfoil S9037. These are screening
+flags, not automatic exclusions: a source/interpolation problem is a hypothesis
+to verify, and large suction alone is not proof of an invalid label. No values were
+clipped, no rows removed, and Cp was not introduced into training. These unused
+pressure values cannot be the direct cause of the existing coefficient-model errors.
+
+The same audit reconstructed geometry at 1,001 cosine-spaced chord locations from
+50 versus 100 sampled stations. The reference was the normalized source surfaces,
+linearly interpolated with the same nonnegative-thickness rule. Errors are **chord
+fractions**, not coefficient errors:
+
+| geometric statistic across training airfoils | 50 stations | 100 stations |
+|---|---:|---:|
+| median thickness RMSE | 1.559e-4 | 7.321e-5 |
+| p95 of maximum thickness deviation | 2.715e-3 | 2.211e-3 |
+| median camber RMSE | 2.781e-5 | 9.176e-6 |
+
+The stored 50-station features reproduce the conversion to within 1e-16. Increasing
+the station count reduces interpolation error, but the largest deviations remain
+near the nose and extra stations cannot restore detail already absent from the raw
+uniform grid. This audit does not establish an aerodynamic accuracy gain from higher
+resolution. The temporary audit script was removed; no model fitting or local Torch
+installation was performed.
+
 ### Testing
 
 ```bash
 python -m pytest tests/test_kaggle_sync.py tests/test_kaggle_notebook.py tests/test_analysis.py tests/test_torch_mlp.py -m 'not gpu'
 python -m pytest tests/test_accuracy_guard.py tests/test_study.py
 python -m pytest tests/test_auxiliary.py tests/test_tail_risk.py tests/test_auxiliary_study.py
+python -m pytest tests/test_ensemble.py tests/test_fold_gate.py tests/test_fold_study.py
 ```
 
 The full suite, including model fitting, runs in the Kaggle notebook preflight. The

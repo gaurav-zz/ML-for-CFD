@@ -57,6 +57,9 @@ jobs:
           tests/test_features.py
           tests/test_tail_risk.py
           tests/test_auxiliary_study.py
+          tests/test_ensemble.py
+          tests/test_fold_gate.py
+          tests/test_fold_study.py
 
   cloud-accuracy:
     name: Compare Completed Kaggle Candidate

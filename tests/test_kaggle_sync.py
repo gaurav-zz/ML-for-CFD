@@ -272,8 +272,43 @@ def test_auxiliary_study_entrypoint_is_distinct_and_holdouts_are_deferred(tmp_pa
     for cell in document["cells"]:
         if cell["cell_type"] == "code":
             compile("".join(cell["source"]), cell["id"], "exec")
-    with pytest.raises(ValueError, match="not both"):
+    with pytest.raises(ValueError, match="only one"):
         stage_kernel("me/run", "me/data", tmp_path / "invalid", study=True, auxiliary_study=True)
+
+
+def test_fold_study_reuses_bootstrap_but_never_standard_test_cells(tmp_path):
+    staged = stage_kernel("me/folds", "me/data", tmp_path / "stage", fold_study=True)
+    document = json.loads((staged / "v2_experiment_kaggle.ipynb").read_text())
+    cells = {cell["id"]: "".join(cell["source"]) for cell in document["cells"]}
+    assert "KAGGLE_STUDY_MODE = 'folds'" in cells["kaggle-source-bundle"]
+    assert "3 folds x 3 seeds x 2 arms = 18 fits" in cells["v2-queue"]
+    assert "run_fold_study(split, feature_columns, target_columns, RUN_OUTPUT" in cells["v2-train"]
+    assert "split.test" not in cells["v2-train"]
+    assert "test-results" not in cells and "v2-analysis" not in cells
+    for cell in document["cells"]:
+        if cell["cell_type"] == "code":
+            compile("".join(cell["source"]), cell["id"], "exec")
+
+
+@pytest.mark.parametrize("other", ["study", "auxiliary_study"])
+def test_fold_study_refuses_combined_modes(tmp_path, other):
+    with pytest.raises(ValueError, match="only one"):
+        stage_kernel("me/folds", "me/data", tmp_path / "bad", fold_study=True, **{other: True})
+
+
+def test_fold_cli_routes_private_gpu_mode_without_real_submission(monkeypatch, capsys):
+    import sys
+
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["kaggle_sync", "kernel", "me/folds", "--dataset", "me/data", "--fold-study"])
+    monkeypatch.setattr(kaggle_sync, "push_kernel", lambda *args, **kwargs: calls.append((args, kwargs)) or "mock submission")
+    kaggle_sync.main()
+    assert len(calls) == 1
+    assert calls[0][0][:2] == ("me/folds", "me/data")
+    assert calls[0][1]["fold_study"] is True
+    assert calls[0][1]["study"] is calls[0][1]["auxiliary_study"] is False
+    assert calls[0][1]["accelerator"] == "gpu" and calls[0][1]["private"] is True
+    assert "mock submission" in capsys.readouterr().out
 
 
 def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):

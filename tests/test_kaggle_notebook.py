@@ -93,7 +93,8 @@ def test_setup_cell_targets_kaggle_paths_not_drive(cells):
     assert "/kaggle/input" in cells["v2-config"]
 
 
-def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, kaggle_inputs, monkeypatch):
+@pytest.mark.parametrize("study_mode", ["auxiliary", "folds"])
+def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, kaggle_inputs, monkeypatch, study_mode):
     from src.data import auxiliary
     from src.training import comparison
 
@@ -120,7 +121,7 @@ def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, k
     monkeypatch.setattr(comparison, "load_frozen_split", loader)
     namespace = {
         "Path": Path, "PROJECT_ROOT": root,
-        "KAGGLE_STUDY_MODE": "auxiliary",
+        "KAGGLE_STUDY_MODE": study_mode,
     }
     # Run the real setup chain: injecting dataset variables here concealed a
     # DATA_DIR typo that the notebook's actual resolver never defines.
@@ -142,12 +143,20 @@ def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, k
     assert polars_path.read_bytes() == original_bytes
 
 
-def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(kaggle_inputs, tmp_path, monkeypatch):
+@pytest.mark.parametrize("study_mode,module_name,entry_name", [
+    ("auxiliary", "auxiliary_study", "run_auxiliary_study"),
+    ("folds", "fold_study", "run_fold_study"),
+])
+def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(
+    kaggle_inputs, tmp_path, monkeypatch, study_mode, module_name, entry_name,
+):
+    from importlib import import_module
     from importlib import metadata as package_metadata
 
     from src.data import auxiliary
-    from src.training import auxiliary_study
     from src.utils.kaggle_sync import stage_kernel
+
+    study_module = import_module(f"src.training.{module_name}")
 
     data_dir, root = kaggle_inputs
     keys = ["geometry_id", "Alpha", "Re", "Ncrit"]
@@ -166,13 +175,13 @@ def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(kaggle_in
         return {"status": "mocked: no fitting"}
 
     monkeypatch.setattr(auxiliary, "load_auxiliary", load_labels)
-    monkeypatch.setattr(auxiliary_study, "run_auxiliary_study", record_study)
+    monkeypatch.setattr(study_module, entry_name, record_study)
     installed_version = package_metadata.version
     # Version logging must not require the cloud-only training/plot dependencies
     # in the minimal fit-free CI environment.
     monkeypatch.setattr(package_metadata, "version",
                         lambda name: "mock" if name in {"torch", "matplotlib"} else installed_version(name))
-    staged = stage_kernel("me/study", "me/data", tmp_path / "stage", auxiliary_study=True)
+    staged = stage_kernel("me/study", "me/data", tmp_path / "stage", **{module_name: True})
     document = nbformat.read(staged / NOTEBOOK.name, as_version=4)
     sources = {cell.id: cell.source for cell in document.cells if cell.cell_type == "code"}
     # These are the real bootstrap's outputs, not guessed dataset globals.
@@ -196,7 +205,7 @@ def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(kaggle_in
     assert targets == ["Cl", "Cd", "Cm"] and len(features) == 113
     assert "Cdp" not in features and split.train.Cdp_observed.all()
     assert options["device"] == "cuda"
-    assert options["run_metadata"]["study_mode"] == "auxiliary"
+    assert options["run_metadata"]["study_mode"] == study_mode
     assert options["run_metadata"]["auxiliary"]["sidecar_sha256"] == "d" * 64
     assert not output.exists(), "The study entrypoint is mocked; no fit/artifact work may occur"
 
