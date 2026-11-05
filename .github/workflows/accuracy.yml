@@ -60,6 +60,7 @@ jobs:
           tests/test_fold_gate.py
           tests/test_fold_study.py
           tests/test_reliability_analysis.py
+          tests/test_referral_calibration.py
 
   cloud-accuracy:
     name: Compare Completed Kaggle Candidate

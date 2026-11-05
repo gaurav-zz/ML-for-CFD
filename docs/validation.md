@@ -196,6 +196,99 @@ speedup. This is **not measured project performance**: referred cases can cost m
 meshes are shared per geometry, and fully/partially retained polars change the cost.
 Track wall time and CPU/GPU resource consumption, not just the number of predictions.
 
+## Exploratory Calibration Protocol
+
+The exploratory study fixes the selective-floor Cdp ensemble and calibrates referral
+thresholds, not surrogate weights. It is explicitly developmental: the source
+evaluation folds have already informed model choices, so a new split of these rows
+does not become a fresh blind benchmark or establish calibrated confidence.
+
+- Split each original evaluation fold's sorted geometry IDs once, using RNG seed
+  `20261105 + fold_id`: the first half is calibration, the remainder audit. This gives
+  95 calibration geometries per fold and 96/96/95 audit geometries. Preserve the
+  original surrogate fit/stopping partitions and keep both new groups outside them.
+- Calibrate independently for each fixed fold ensemble. Do not pool calibration
+  examples across folds: other fold models were trained on some audit geometries.
+- Compare raw log-Cd spread, the fixed geometry-support distance, and their maximum
+  calibration-percentile score. Fit empirical score distributions on eligible
+  calibration inputs only; do not rerank audit inputs. For the combined rule, both
+  native score components must lie inside their closed calibration min/max intervals
+  before percentile transformation; values outside require referral. This conservative
+  support guard is additional to the native methods' fixed cutoff and numerical rules.
+- Use the approved exploratory Cd relative-error bands 5%, 10%, and 20%. Separately
+  examine empirical retained over-budget fractions capped at 5% and 10% during
+  calibration. These two quantities are not interchangeable, and neither is an
+  approved operational limit or a confidence level.
+- Evaluate all 21 row-weighted calibration quantiles `0, .05, ..., 1`, using the
+  `lower` interpolation rule on nonclipped calibration rows. Fit CDFs on those same
+  eligible rows, without filtering by true error. Retain ties and always refer
+  numerical clipping. Choose the largest calibration coverage meeting the
+  empirical risk cap and retaining at least 20 distinct calibration geometries.
+  This minimum support is an experimental safeguard, not a statistical guarantee.
+  Break equal-coverage ties with the lower threshold. Evaluate every candidate:
+  conditional retained risk need not be monotone in the threshold. If no threshold
+  qualifies, refer all audit requests; do not invent a fallback.
+- Freeze each threshold before reading audit errors. Report all three score methods,
+  three error bands, and two risk caps for every fold, including empty/no-policy
+  outcomes. Do not choose a winning method or threshold from the audit results.
+- Compare retained audit errors against the no-referral baseline on those same audit
+  rows, not against a different full-population denominator. Also retain full-row
+  metrics, FP/FN counts, row- and geometry-level coverage, and Cl/Cm error diagnostics.
+  Report `FP / (FP + TN)` separately from the unnecessary-referral share
+  `FP / (TP + FP)`; report per-geometry risk concentration without changing the
+  row-weighted selection objective. Undefined denominators remain undefined.
+
+This is point-level approximation-error research. It does not qualify complete
+polars, design-ranking decisions, multi-target budgets, or formal conditional-risk
+guarantees. No primary model fitting, original validation/test scoring, solver runs,
+or production/default changes are part of it. Computational tests and the calibration
+study run on cloud CPU first, with source, input, and partition provenance retained.
+
+### Findings And Limits
+
+The frozen cloud-CPU experiment completed with 110 passing tests, no surrogate
+retraining, and no solver runs. It retained all 54 fold/method/error-band/risk-cap
+outcomes, including policies that referred every audit request.
+
+| Cd error band | Policies with a supported calibration threshold | Separate audit outcome |
+|---|---:|---|
+| 5% | 0 of 18 | No threshold met the calibration cap/support requirements |
+| 10% | 0 of 18 | No threshold met the calibration cap/support requirements |
+| 20% | 13 of 18 | 12 of the 13 selected policies exceeded their calibration risk cap |
+
+For the 20% error band and 10% empirical calibration-risk cap, the selected rules
+retained approximately 89-96% of audit rows, but the retained over-budget fraction
+was 10.26-13.14%. The lone selected policy with an audit risk below its cap is not
+chosen as a winner after inspecting the audit. Empty retention has undefined risk,
+not a successful zero-risk result. Per-geometry and full/partial polar diagnostics
+remain important even when a point-level average looks acceptable.
+
+These findings do not prove that selective screening is ineffective. They show that
+the tested global thresholds on disagreement and geometry distance are insufficient
+to support the requested exploratory error/risk combinations consistently. A later
+study should investigate richer prediction-time error signals, including operating
+conditions and geometry/flow interactions, rather than relaxing caps to label this
+run successful. It must again reserve calibration and audit groups and evaluate the
+specific fixed surrogate that will be used; thresholds cannot be assumed transferable
+to different weights or a final refitted ensemble. No production policy is qualified.
+
+Evidence is stored under `results/kaggle/referral-calibration-dev-v1/`, from the private
+[`airfoil-exploratory-referral-calibration`](https://www.kaggle.com/code/purplray/airfoil-exploratory-referral-calibration)
+kernel. Its source SHA256 is
+`795c18af7ea300def7c6e8167357bde67e346638287a5e5102d9bc1631660003`.
+The archived frozen plan, partitions, calibration-only CDFs, candidates, selected
+policies, full audit rows, and metric tables preserve the complete development result.
+
+To reproduce the same fixed study in a prepared cloud CPU environment:
+
+```bash
+python -m src.training.referral_calibration \
+  --selective-run <completed-selective-run-directory> \
+  --polars <airfoil_polars.csv> --split configs/frozen_split.json \
+  --geometry-coverage <geometry_coverage.csv> \
+  --output-dir <fresh-output-directory>
+```
+
 ## Reproduce The Offline Analysis
 
 Run computational validation on cloud first. The analyzer uses saved arrays and
