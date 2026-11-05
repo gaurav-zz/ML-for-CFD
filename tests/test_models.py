@@ -16,6 +16,7 @@ from src.training.train import train_model
 from src.utils.metrics import regression_metrics
 
 
+@pytest.mark.cloud_fit
 @pytest.mark.parametrize("builder", [build_linear, build_polynomial, build_rf, build_gb, build_mlp])
 def test_models_fit_and_predict(builder):
     x = np.arange(90, dtype=float).reshape(30, 3)
@@ -25,6 +26,7 @@ def test_models_fit_and_predict(builder):
     assert model.predict(x).shape == y.shape
 
 
+@pytest.mark.cloud_fit
 @pytest.mark.parametrize("target_columns", [None, 1, 2], ids=["single-target", "single-column", "multi-target"])
 @pytest.mark.parametrize("scale_targets", [False, True], ids=["unscaled", "scaled"])
 def test_train_gradient_boosting_target_shapes_and_roundtrip(tmp_path, target_columns, scale_targets):
@@ -58,6 +60,7 @@ def test_train_gradient_boosting_target_shapes_and_roundtrip(tmp_path, target_co
     np.testing.assert_array_equal(saved_model.predict(x), predictions)
 
 
+@pytest.mark.cloud_fit
 @pytest.mark.parametrize("target_columns", [1, 2])
 def test_scaled_gradient_boosting_uses_portable_per_target_estimators(tmp_path, target_columns):
     x = np.arange(120, dtype=float).reshape(40, 3)
@@ -125,6 +128,7 @@ def test_model_factories_accept_explicit_comparison_limits(builder, options):
         assert params["l2_regularization"] == 1e-4
 
 
+@pytest.mark.cloud_fit
 @pytest.mark.parametrize("target_columns", [None, 1, 2], ids=["single-target", "single-column", "multi-target"])
 def test_target_scaler_training_statistics_and_physical_unit_roundtrip(tmp_path, target_columns):
     x_train = np.linspace(-2, 2, 24).reshape(-1, 1)

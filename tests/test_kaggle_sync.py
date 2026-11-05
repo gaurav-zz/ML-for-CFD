@@ -311,18 +311,147 @@ def test_fold_cli_routes_private_gpu_mode_without_real_submission(monkeypatch, c
     assert "mock submission" in capsys.readouterr().out
 
 
-def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
+@pytest.mark.parametrize("option,mode,entry,variant", [
+    ("input_scaling_study", "input_scaling", "run_input_scaling_fold_study", "profile_rms_floor"),
+    ("selective_scaling_study", "selective_scaling", "run_selective_scaling_fold_study", "profile_rms_floor_1pct"),
+])
+def test_input_scaling_study_routes_one_frozen_paired_experiment(tmp_path, option, mode, entry, variant):
+    staged = stage_kernel("me/scaling", "me/data", tmp_path / "stage", **{option: True})
+    document = json.loads((staged / "v2_experiment_kaggle.ipynb").read_text())
+    cells = {cell["id"]: "".join(cell["source"]) for cell in document["cells"]}
+    assert f"KAGGLE_STUDY_MODE = {mode!r}" in cells["kaggle-source-bundle"]
+    fit_note = "18 fresh fits" if mode == "selective_scaling" else "18 fits"
+    assert f"3 folds x 3 seeds x 2 arms = {fit_note}" in cells["v2-queue"]
+    assert "Cdp weight 0.1 in both arms" in cells["v2-queue"]
+    assert f"standard versus {variant}" in cells["v2-queue"]
+    assert f"from src.training.fold_study import {entry}" in cells["v2-train"]
+    assert f"{entry}(split, feature_columns, target_columns, RUN_OUTPUT" in cells["v2-train"]
+    assert "run_fold_study(" not in cells["v2-train"]
+    assert "compare_models(" not in cells["v2-train"]
+    assert "Compare ensemble to ensemble" in cells["queue-notes"]
+    assert "split.test" not in cells["v2-train"]
+    assert document["cells"][-1]["id"] == "v2-train"
+    assert not {"test-results", "v2-analysis", "analysis-plots", "validation-results"}.intersection(cells)
+    if mode == "selective_scaling":
+        assert "Fixed 1% RMS scale floor, not 1% accuracy" in cells["v2-queue"]
+        assert "same relative gates" in cells["queue-notes"]
+        assert "no ratio tuning or sweep" in cells["queue-notes"]
+        original = json.loads(kaggle_sync.DEFAULT_NOTEBOOK.read_text())
+        assert document["metadata"] == original["metadata"]
+        assert (document["nbformat"], document["nbformat_minor"]) == (original["nbformat"], original["nbformat_minor"])
+        for staged_cell, original_cell in zip(document["cells"][1:], original["cells"]):
+            assert {key: value for key, value in staged_cell.items() if key != "source"} == {
+                key: value for key, value in original_cell.items() if key != "source"
+            }
+            if staged_cell["id"] not in {"v2-train", "v2-queue", "queue-notes"}:
+                assert staged_cell == original_cell
+    for cell in document["cells"]:
+        if cell["cell_type"] == "code":
+            compile("".join(cell["source"]), cell["id"], "exec")
+
+
+@pytest.mark.parametrize("option,other", [
+    ("input_scaling_study", "study"),
+    ("input_scaling_study", "auxiliary_study"),
+    ("input_scaling_study", "fold_study"),
+    ("selective_scaling_study", "study"),
+    ("selective_scaling_study", "auxiliary_study"),
+    ("selective_scaling_study", "fold_study"),
+    ("selective_scaling_study", "input_scaling_study"),
+])
+def test_input_scaling_study_refuses_combined_modes(tmp_path, option, other):
+    with pytest.raises(ValueError, match="only one"):
+        stage_kernel("me/scaling", "me/data", tmp_path / "bad", **{option: True, other: True})
+    assert not (tmp_path / "bad").exists()
+    runner = FakeRunner(stdout="ready")
+    with pytest.raises(ValueError, match="only one"):
+        push_kernel("me/scaling", "me/data", runner=runner, **{option: True, other: True})
+    assert not runner.commands, "Conflicting study flags must fail before any Kaggle command"
+
+
+@pytest.mark.parametrize("flag,entry", [
+    ("--input-scaling-study", "run_input_scaling_fold_study"),
+    ("--selective-scaling-study", "run_selective_scaling_fold_study"),
+])
+def test_input_scaling_cli_and_push_forward_private_mode_without_submission(monkeypatch, capsys, flag, entry):
+    import sys
+
+    calls = []
+    option = flag[2:].replace("-", "_")
+    monkeypatch.setattr(sys, "argv", ["kaggle_sync", "kernel", "me/scaling", "--dataset", "me/data", flag])
+    with monkeypatch.context() as patch:
+        patch.setattr(kaggle_sync, "push_kernel", lambda *args, **kwargs: calls.append((args, kwargs)) or "mock scaling submission")
+        kaggle_sync.main()
+    assert len(calls) == 1 and calls[0][1][option] is True
+    assert all(calls[0][1][key] is False for key in (
+        "study", "auxiliary_study", "fold_study", "input_scaling_study", "selective_scaling_study",
+    ) if key != option)
+    assert calls[0][1]["private"] and calls[0][1]["accelerator"] == "gpu"
+    assert "mock scaling submission" in capsys.readouterr().out
+
+    commands = []
+    def runner(command, **kwargs):
+        commands.append(command)
+        if command[:3] == ["kaggle", "kernels", "push"]:
+            stage = Path(command[command.index("-p") + 1])
+            metadata = json.loads((stage / "kernel-metadata.json").read_text())
+            notebook = json.loads((stage / metadata["code_file"]).read_text())
+            assert metadata["is_private"] and metadata["enable_gpu"]
+            assert entry in "".join(notebook["cells"][-1]["source"])
+            mode = "selective_scaling" if option == "selective_scaling_study" else "input_scaling"
+            assert f"KAGGLE_STUDY_MODE = {mode!r}" in "".join(notebook["cells"][0]["source"])
+        return SimpleNamespace(stdout="ready", returncode=0)
+
+    assert push_kernel("me/scaling", "me/data", runner=runner, **{option: True}) == "ready"
+    assert commands[0] == ["kaggle", "datasets", "status", "me/data"]
+    assert len(commands) == 2 and commands[1][:3] == ["kaggle", "kernels", "push"]
+    assert not Path(commands[1][commands[1].index("-p") + 1]).exists()
+
+
+@pytest.mark.parametrize("flag,other", [
+    ("--input-scaling-study", "--study"),
+    ("--input-scaling-study", "--auxiliary-study"),
+    ("--input-scaling-study", "--fold-study"),
+    ("--selective-scaling-study", "--study"),
+    ("--selective-scaling-study", "--auxiliary-study"),
+    ("--selective-scaling-study", "--fold-study"),
+    ("--selective-scaling-study", "--input-scaling-study"),
+])
+def test_input_scaling_cli_refuses_combined_modes_before_upload(monkeypatch, flag, other):
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["kaggle_sync", "kernel", "me/scaling", "--dataset", "me/data",
+                                     flag, other])
+    monkeypatch.setattr(kaggle_sync, "push_kernel", lambda *args, **kwargs: pytest.fail("No submission may occur"))
+    with pytest.raises(SystemExit) as error:
+        kaggle_sync.main()
+    assert error.value.code == 2
+
+
+def test_selective_scaling_flag_is_appended_and_opt_in():
+    import inspect
+
+    for helper in (stage_kernel, push_kernel):
+        parameters = inspect.signature(helper).parameters
+        assert list(parameters)[-1] == "selective_scaling_study"
+        assert parameters["selective_scaling_study"].default is False
+
+
+@pytest.mark.parametrize("study_mode", ["accuracy", "selective_scaling"])
+def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path, study_mode):
     import ast
     import base64
     import hashlib
     import io
     import zipfile
 
-    first = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "gpu")
-    second = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "gpu")
+    first = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "gpu", study_mode=study_mode)
+    second = kaggle_sync._source_cell(kaggle_sync.DEFAULT_SOURCE_ROOT, "gpu", study_mode=study_mode)
     assert first == second
     syntax = ast.parse("".join(first["source"]))
     assignments = {node.targets[0].id: node.value for node in syntax.body if isinstance(node, ast.Assign)}
+    assert ast.literal_eval(assignments["KAGGLE_STUDY_MODE"]) == study_mode
+    assert ast.literal_eval(assignments["KAGGLE_ACCELERATOR"]) == "gpu"
     payload = base64.b64decode(ast.literal_eval(assignments["_source_archive"].args[0]))
     assert hashlib.sha256(payload).hexdigest() == ast.literal_eval(assignments["BUNDLED_SOURCE_SHA256"])
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
@@ -334,6 +463,10 @@ def test_source_bundle_is_deterministic_and_excludes_private_files(tmp_path):
         assert "configs/accuracy_baseline/test_evaluation.json" in paths
         assert "requirements-kaggle.txt" in paths
         assert "notebooks/v2_experiment_kaggle.ipynb" in paths
+        if study_mode == "selective_scaling":
+            runner_source = ast.parse(archive.read("src/training/fold_study.py"))
+            assert any(isinstance(node, ast.FunctionDef) and node.name == "run_selective_scaling_fold_study"
+                       for node in runner_source.body)
         assert all(path.startswith(("src/", "tests/", "configs/", "notebooks/", "requirements", "pyproject")) for path in paths)
         assert not any(path.startswith(("data/", "results/", ".")) for path in paths)
 

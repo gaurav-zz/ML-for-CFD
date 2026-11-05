@@ -16,6 +16,8 @@ data/external/*
 # Experiment outputs
 results/colab/
 results/kaggle/
+results/reliability-review/
+results/v2_local/
 results/figures/*
 results/metrics/*
 results/models/*
@@ -25,12 +27,17 @@ results/models/*
 
 # Editor and other tools' local state
 .vscode/
+.workbuddy-ai/
 .kilo/
 
 # Notebook-generated state and OS files
 .ipynb_checkpoints/
 .DS_Store
 HANDOFF.md
+session-ses_eb14.md
 
 # Personal report: keep every copy local, including the docs/ template.
 Minor_Project_Progress_Report.docx
+synopsis minor project (1).pdf
+docs/build_progress_report.py
+docs/figures/

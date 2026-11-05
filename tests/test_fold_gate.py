@@ -9,7 +9,9 @@ import pandas as pd
 import pytest
 
 from src.models.ensemble import METHOD
-from src.training.fold_gate import FOLDS, SOURCE, paired_fold_gate
+from src.training.fold_gate import (
+    FOLDS, SOURCE, paired_fold_gate, paired_input_scaling_fold_gate, paired_selective_scaling_fold_gate,
+)
 from src.training.tail_risk import derive_thresholds, tail_report
 
 
@@ -438,3 +440,164 @@ def test_nonfinite_delta_from_finite_evidence_does_not_leave_partial_averages():
     candidate[2]["targets"]["Cl"]["r2"] = maximum
     gate = assert_inconclusive(reference, candidate)
     assert "nonfinite paired fold delta" in gate["errors"][0]
+
+
+def scaling_paired(candidate_mode="profile_rms_floor", factors=(.05, .05, .05)):
+    reference, candidate = paired(factors)
+    for reports, arm, scaling in ((reference, "cdp_column_scaling", "standard"),
+                                  (candidate, "cdp_profile_scaling", candidate_mode)):
+        for item in reports.values():
+            item.update(predictor=f"{arm}_ensemble", arm=arm, input_scaling=scaling,
+                         study_kind="paired_geometry_input_scaling", member_seeds=[42, 43, 44], aggregation=METHOD)
+            if candidate_mode == "profile_rms_floor_1pct":
+                item["study_variant"] = "selective_profile_floor_1pct"
+    return reference, candidate
+
+
+@pytest.mark.parametrize("candidate_mode", ["profile_rms_floor", "profile_rms_floor_1pct"])
+def test_input_scaling_gate_shares_17_limits_without_relabeling_or_seed_reference(candidate_mode):
+    reference, candidate = scaling_paired(candidate_mode)
+    before = deepcopy((reference, candidate))
+    old = paired_fold_gate(*paired())
+    wrapper = paired_selective_scaling_fold_gate if candidate_mode == "profile_rms_floor_1pct" else paired_input_scaling_fold_gate
+    gate = wrapper(reference, candidate, expected_ids(reference))
+    assert gate["status"] == "pass" and gate["passed"] and gate["eligible"]
+    assert gate["reference_predictor"] == "cdp_column_scaling_ensemble"
+    assert gate["candidate_predictor"] == "cdp_profile_scaling_ensemble"
+    assert gate["study_kind"] == "paired_geometry_input_scaling"
+    assert gate["numerical_safety_checked"] is False
+    if candidate_mode == "profile_rms_floor_1pct":
+        assert gate["study_variant"] == "selective_profile_floor_1pct"
+    else:
+        assert "study_variant" not in gate
+    assert gate["policy"] == old["policy"] and gate["checks"] == old["checks"]
+    assert gate["deltas"] == old["deltas"] and len(gate["checks"]) == 17
+    assert all(row["reference"]["member_seeds"] == [42, 43, 44] for row in gate["fold_stats"])
+    assert all(row["reference"]["predictor"] == "cdp_column_scaling_ensemble" for row in gate["fold_stats"])
+    assert (reference, candidate) == before
+    assert paired_fold_gate(reference, candidate)["status"] == "inconclusive"
+    json.dumps(gate, allow_nan=False)
+
+
+@pytest.mark.parametrize("arm", ["reference", "candidate"])
+@pytest.mark.parametrize("candidate_mode", ["profile_rms_floor", "profile_rms_floor_1pct"])
+@pytest.mark.parametrize("bad", ["single_seed", "seed_label", "seed_order", "float_seed", "old_label", "swapped_label",
+                                "wrong_arm", "wrong_scaling", "missing_kind", "wrong_kind", "wrong_aggregation"])
+def test_input_scaling_gate_rejects_untruthful_metadata_and_single_reference(arm, bad, candidate_mode):
+    reference, candidate = scaling_paired(candidate_mode)
+    item = (reference if arm == "reference" else candidate)[2]
+    if bad == "single_seed":
+        item["member_seeds"] = [42]
+    elif bad == "seed_label":
+        item["seed"] = 42
+    elif bad == "seed_order":
+        item["member_seeds"] = [44, 43, 42]
+    elif bad == "float_seed":
+        item["member_seeds"] = [42., 43., 44.]
+    elif bad == "old_label":
+        item["predictor"] = "baseline_seed_42" if arm == "reference" else "cdp_ensemble"
+    elif bad == "swapped_label":
+        item["predictor"] = "cdp_profile_scaling_ensemble" if arm == "reference" else "cdp_column_scaling_ensemble"
+    elif bad == "wrong_arm":
+        item["arm"] = "cdp"
+    elif bad == "wrong_scaling":
+        item["input_scaling"] = "per_feature_std"
+    elif bad == "missing_kind":
+        del item["study_kind"]
+    elif bad == "wrong_kind":
+        item["study_kind"] = "seed_study"
+    else:
+        item["aggregation"] = "arithmetic_mean_Cd"
+    wrapper = paired_selective_scaling_fold_gate if candidate_mode == "profile_rms_floor_1pct" else paired_input_scaling_fold_gate
+    gate = wrapper(reference, candidate, expected_ids(reference))
+    assert gate["status"] == "inconclusive" and not gate["passed"] and not gate["eligible"]
+    assert gate["errors"] and gate["checks"] == gate["deltas"] == []
+
+
+@pytest.mark.parametrize("candidate_mode", ["profile_rms_floor", "profile_rms_floor_1pct"])
+def test_input_scaling_relative_gate_is_not_absolute_r2_safety(candidate_mode):
+    reference, candidate = scaling_paired(candidate_mode)
+    wrapper = paired_selective_scaling_fold_gate if candidate_mode == "profile_rms_floor_1pct" else paired_input_scaling_fold_gate
+    candidate[2]["targets"]["Cd"]["r2"] = -10.
+    assert wrapper(reference, candidate)["passed"]
+    candidate[2]["cd_tail"]["max_geometry_rmse"] *= 10
+    assert wrapper(reference, candidate)["status"] == "inconclusive"
+
+
+@pytest.mark.parametrize("wrapper,wrong_mode", [(paired_selective_scaling_fold_gate, "profile_rms_floor"),
+                                             (paired_input_scaling_fold_gate, "profile_rms_floor_1pct")])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_full_and_selective_gates_reject_other_mode_never_infer_from_reports(wrapper, wrong_mode, mixed):
+    right_mode = "profile_rms_floor_1pct" if wrapper is paired_selective_scaling_fold_gate else "profile_rms_floor"
+    reference, candidate = scaling_paired(right_mode if mixed else wrong_mode)
+    candidate[2]["input_scaling"] = wrong_mode
+    # Even a claimed variant matching the gate cannot make the wrong mode truthful.
+    for item in (*reference.values(), *candidate.values()):
+        item["study_variant"] = "selective_profile_floor_1pct"
+    gate = wrapper(reference, candidate, expected_ids(reference))
+    assert gate["status"] == "inconclusive" and not gate["passed"] and not gate["eligible"]
+    assert gate["errors"] and gate["checks"] == gate["deltas"] == []
+    json.dumps(gate, allow_nan=False)
+
+
+@pytest.mark.parametrize("rule,value,passes", [
+    ("primary_rmse", 1.05, True), ("primary_rmse", 1.05000001, False),
+    ("per_fold_tail", .11, True), ("per_fold_tail", .11000001, False),
+    ("mean_tail", 1.05, True), ("mean_tail", 1.05000001, False),
+    ("primary_median", .005, True), ("primary_median", .00500000001, False),
+    ("strict_improvement", 0., False), ("strict_improvement", 5e-13, False),
+    ("strict_improvement", 2e-12, True),
+])
+def test_selective_boundaries_match_historical_17_checks_exactly(rule, value, passes):
+    factors = (.01, .01, value) if rule == "per_fold_tail" else ((.1 * value,) * 3 if rule == "mean_tail" else (.05,) * 3)
+    reference, candidate = scaling_paired("profile_rms_floor_1pct", factors)
+    for fold in FOLDS:
+        if rule == "primary_rmse":
+            for target in ("Cl", "Cm"):
+                candidate[fold]["targets"][target]["rmse"] = reference[fold]["targets"][target]["rmse"] * value
+        elif rule == "mean_tail":
+            for target in ("Cl", "Cd", "Cm"):
+                candidate[fold]["targets"][target]["median_relative_error"] = .09
+        elif rule == "primary_median":
+            candidate[fold]["targets"]["Cl"]["median_relative_error"] = reference[fold]["targets"]["Cl"]["median_relative_error"] + value
+        elif rule == "strict_improvement":
+            candidate[fold]["targets"]["Cd"]["median_relative_error"] = reference[fold]["targets"]["Cd"]["median_relative_error"] - value
+    selective = paired_selective_scaling_fold_gate(reference, candidate, expected_ids(reference))
+    for item in candidate.values():
+        item["input_scaling"] = "profile_rms_floor"
+    historical = paired_input_scaling_fold_gate(reference, candidate, expected_ids(reference))
+    assert selective["passed"] is historical["passed"] is passes
+    assert len(selective["checks"]) == 17
+    assert selective["checks"] == historical["checks"]
+    assert selective["deltas"] == historical["deltas"]
+    assert selective["policy"] == historical["policy"]
+
+
+@pytest.mark.parametrize("bad", ["missing_fold", "missing_r2", "nonfinite", "holdout", "row_identity", "missing_stress", "coverage"])
+def test_selective_missing_or_invalid_evidence_has_historical_inconclusive_semantics(bad):
+    reference, candidate = scaling_paired("profile_rms_floor_1pct")
+    ids = expected_ids(reference)
+    if bad == "missing_fold":
+        del candidate[2]
+    elif bad == "missing_r2":
+        del candidate[2]["targets"]["Cl"]["r2"]
+    elif bad == "nonfinite":
+        candidate[2]["targets"]["Cl"]["r2"] = np.inf
+    elif bad == "holdout":
+        candidate[2]["source"] = "canonical_test"
+    elif bad == "row_identity":
+        candidate[2]["row_sha256"] = "f" * 64
+    elif bad == "missing_stress":
+        candidate[2]["stress"]["low_re"]["missing"] = True
+    else:
+        ids.pop()
+    selective = paired_selective_scaling_fold_gate(reference, candidate, ids)
+    for item in candidate.values():
+        item["input_scaling"] = "profile_rms_floor"
+    historical = paired_input_scaling_fold_gate(reference, candidate, ids)
+    assert selective["status"] == historical["status"] == "inconclusive"
+    assert selective["errors"] == historical["errors"]
+    assert selective["reasons"] == historical["reasons"]
+    assert selective["checks"] == selective["deltas"] == []
+    assert not selective["passed"] and not selective["eligible"]
+    json.dumps(selective, allow_nan=False)

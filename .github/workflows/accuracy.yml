@@ -40,9 +40,8 @@ jobs:
           python-version: '3.12'
       - name: Install portable test dependencies (no torch)
         run: python -m pip install 'pytest>=7.4' 'numpy>=1.24' 'pandas>=2.0' 'scikit-learn>=1.3' 'PyYAML>=6.0' 'nbformat>=5.10'
-      # Do not replace this allowlist with all tests or only a marker exclusion:
-      # some legacy, unmarked model/comparison tests fit estimators. Notebook
-      # fitting tests require an explicit Kaggle-only opt-in.
+      # Keep cloud CI focused on portable checks. Real fitting tests are also
+      # marked and guarded by tests/conftest.py for explicit Kaggle execution.
       - name: Run explicit fit-free test files
         run: >-
           python -m pytest -q
@@ -60,6 +59,7 @@ jobs:
           tests/test_ensemble.py
           tests/test_fold_gate.py
           tests/test_fold_study.py
+          tests/test_reliability_analysis.py
 
   cloud-accuracy:
     name: Compare Completed Kaggle Candidate

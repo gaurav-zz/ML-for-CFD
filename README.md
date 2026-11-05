@@ -1,812 +1,171 @@
 # Airfoil ML Surrogate
 
-Machine-learning surrogate modeling for aerodynamic prediction of airfoils.
+**Rapid aerodynamic screening, with reference-data and physics-solver support where the surrogate is insufficient.**
 
-## Research Question
+## Goal
 
-Can machine-learning models learn the relationship between airfoil geometry, flow
-conditions, and aerodynamic coefficients accurately enough to act as a fast surrogate for
-conventional aerodynamic analysis — **on airfoils they have never seen**?
+The project synopsis defines the aim as reducing the time and computational cost of
+airfoil analysis through machine-learning predictions of aerodynamic characteristics.
+The objective is not to replace every simulation or maximize one aggregate R² value.
 
-That last clause is the generalization claim. Valid geometry and a geometry-disjoint
-evaluation protocol are prerequisites; accuracy improvements still require measurement.
+The intended workflow is to batch-screen many geometries and operating points,
+identify where predictions are sufficiently useful for the task, and refer uncertain
+or unsupported cases to existing reference data or, when eligible, a physics solver.
+Useful acceleration must be measured together with prediction error, referral quality,
+and the computational cost of the remaining reference work.
 
-## Status
+This follows the local `synopsis minor project (1).pdf`: geometry-based modelling,
+comparative regression models, computational efficiency, unseen-geometry validation,
+and pressure prediction/visualization where feasible.
 
-**Latest (20 October 2026):** the NASA-inspired Cdp auxiliary study completed all
-12 fits. It passed the training-only development gate, but **failed the frozen test
-tail audit**: average drag RMSE improved, while p95 airfoil error and seed 43's drag
-errors exceeded the predeclared limits. The auxiliary model is not promoted.
-Defaults and the pinned CPU reference remain unchanged.
+## Current Status
 
-The completed Kaggle CPU run (`20261018T115938507650Z`) and automatic-GPU run
-(`20261018T121854085520Z`) both selected **Torch Huber** on validation for all three
-targets. Test results use the same **123 unseen airfoils / 116,484 operating points**:
-
-| target | original MLP median relative error | CPU Huber median | GPU Huber median | CPU Huber RMSE | CPU Huber R² |
-|---|---|---|---|---|---|
-| `Cl` | 5.96% | **3.81%** | 3.81% | 0.08688 | 0.9871 |
-| `Cd` | 8.11% | **5.57%** | 5.57% | 0.01154 | 0.8766 |
-| `Cm` | 12.28% | **9.65%** | 9.65% | 0.01297 | 0.9369 |
-
-Drag median error decreased by **2.54 percentage points**, about 31% relative to the
-original MLP. On validation, the controlled GPU MSE/Huber pair gives **6.83% / 5.90%**
-median drag error. This supports a loss-specific improvement in that experiment;
-the larger baseline-to-Huber change also includes architecture, optimizer, features,
-symmetry, and stopping changes. It is **not an isolated geometry-fix gain**.
-
-The GPU runtime reported **Tesla T4**, PyTorch 2.11.0+cu128, CUDA 12.8, and two visible
-GPUs; training used one CUDA device, not distributed training. GPU Huber fitted in
-184.6 seconds, stopped after **214 epochs**, and restored **epoch 184**. The CPU Huber
-run used the same stopping and best-epoch counts. GPU cloud preflight passed **325
-tests** (two CPU-only cases skipped); inference is portable NumPy on CPU.
-
-The original MLP had validation drag R² 0.9224 versus test 0.6393 while median error
-stayed near 8.1%. Its 66%-thick FX 79-W-660A extrapolation case contributed 80.9% of
-test drag squared error. This is why median relative error is the headline, with
-absolute error, R², and tail diagnostics alongside it.
-
-**All training runs on Kaggle through the API.** Local checks and saved-model analysis
-do not require PyTorch. The completed CPU/GPU runs share seed 42; matching devices is
-not a multi-seed study. The test set has been inspected diagnostically, so new folds
-or new airfoils remain necessary for stronger confirmation.
-
-### Completed controlled study
-
-Run `20261019T115249707139Z`, from source `96bf0bc`, completed **12/12 fits** on a
-Tesla T4 in about **33.4 minutes**, including preflight and evaluation. Cloud
-preflight passed **469 tests**, with four skips and one deselected test. All fits
-stopped on validation patience, restored their best checkpoints, and recorded their
-device, seed, epoch count and hyperparameters. Training remained on Kaggle.
-
-**Three paired seeds (42, 43, 44):** mean test median-relative error plus/minus sample
-standard deviation, in percent. These are three-seed descriptive statistics, not
-confidence intervals or geometry-fold uncertainty.
-
-| target | Torch MSE | Torch Huber | mean reduction |
-|---|---|---|---|
-| `Cl` | 4.782 +/- 0.125% | **3.834 +/- 0.017%** | 0.948 pp |
-| `Cd` | 6.633 +/- 0.061% | **5.612 +/- 0.065%** | 1.021 pp |
-| `Cm` | 11.316 +/- 0.507% | **10.124 +/- 0.451%** | 1.192 pp |
-
-Huber improved each target's median in every paired seed. However, its drag tail
-performance is not seed-stable on the **same test rows**:
-
-| Huber seed | test Cd median error | test Cd RMSE | test Cd R² |
-|---|---|---|---|
-| 42 | 5.574% | 0.01157 | 0.8760 |
-| 43 | 5.575% | 0.01553 | 0.7766 |
-| 44 | 5.687% | 0.04159 | **-0.6021** |
-
-Saved-weight diagnostics attribute **96.08% of seed 44's drag squared error** to
-FX 79-W-660A. This is genuine extrapolation instability, not a change of test-set
-variance or evidence that a good pooled median protects every airfoil. No seed
-was selected using its test performance.
-
-**Seed-42 sweep, selected only on validation drag median error:**
-
-| Huber delta | weight decay | validation Cd median error |
-|---|---|---|
-| 0.05 | 1e-5 (reference) | 5.898% |
-| 0.02 | 1e-5 | 6.345% |
-| 0.10 | 1e-5 | 5.846% |
-| **0.05** | **0** | **5.660% (selected)** |
-| 0.05 | 1e-4 | 7.762% |
-
-Only the selected sweep alternative was evaluated on test, after the choice was
-frozen. It produced median errors Cl **3.915%**, Cd **5.542%**, Cm **9.569%**. Against
-the pinned CPU Huber reference, those changes are **+0.102, -0.031, -0.081 pp**,
-respectively, so the requested 0.5-pp median guard **passes**.
-
-That pass is limited: selected-model Cd RMSE rises from **0.01154 to 0.01935**, and
-R² falls from **0.8766 to 0.6531**. FX 79-W-660A accounts for **81.87%** of its drag
-squared error. Post-stall R² improves to 0.7691, while pre-stall R² is only 0.5023
-and Re=50,000 R² is 0.0718. The 0.031-pp test-median improvement is smaller than the
-observed three-seed variation of the reference. The median-only CI policy does not
-guard these tails; it must not be interpreted as proof of overall improvement.
-
-**Torch airfoil-exposure diagnostic:** both arms used 347,877 training rows, the
-same 54,917 audit rows, and a common 80,612-row stopping set. The exposed arm replaced
-54,974 training rows with other operating points from 114 audit airfoils. Actual
-audit rows never entered training, and canonical validation/test rows were unused.
-
-| audit median error | unseen-airfoil arm | exposed-airfoil arm |
-|---|---|---|
-| `Cl` | 4.277% | 3.238% |
-| `Cd` | 5.938% | 4.154% |
-| `Cm` | 10.151% | 7.745% |
-
-Drag R² rises from 0.9350 to 0.9568 on identical audit rows/SST. Exposure makes the
-audit easier: drag median error improves by **1.784 pp**, about 30%. This supports
-geometry-disjoint evaluation for unseen-airfoil claims. It is not a production
-gain, a universal leakage-effect estimate, or proof that geometry IDs are memorized.
-
-Artifacts: `results/kaggle/controlled-study-v2/experiments/v2/20261019T115249707139Z/`.
-The source archive SHA256 is
-`e2512826802de6e7dfbfaa61221cb53a1cb471819225ebe10b01b18e44eb5fc5`.
-`study_selection.json` preserves the validation choice, and the seed summaries,
-paired deltas, leakage scores and selected-model diagnostics remain separate files.
-
-### Remaining drag error
-
-CPU Huber's post-stall angle proxy (`|Alpha| > 12`) has **Cd R² = 0.7138**. A more
-detailed breakdown locates the remaining error:
-
-| absolute Alpha | rows | airfoils | Cd RMSE | Cd R² | share of post-stall squared error |
-|---|---|---|---|---|---|
-| `(12,16]` | 14,960 | 115 | 0.01537 | 0.7659 | 45.39% |
-| `(16,20]` | 5,566 | 103 | 0.02748 | 0.3735 | 53.98% |
-| `>20` | 63 | 1 | 0.02806 | -0.7096 | 0.64% |
-
-FX 79-W-660A contributes **68.71%** of the 16-20 degree bin's squared error and E863
-another **11.30%**. Negative-alpha rows contribute **60.99%** of total post-stall
-squared error. Only one airfoil has observations above 20 degrees; this cannot
-establish general fully-separated-flow accuracy.
-
-Using observed signed-lift maxima separately by airfoil/Re/Ncrit/angle sign, 2,076
-half-polars have interior peaks, 376 are boundary-censored, and 11 are too sparse.
-Among interior curves, post-stall Cd RMSE is **0.01088 within +/-2 degrees of the
-peak**, versus **0.02529 farther beyond it**. Farther-post-peak rows account for
-42.24% of post-stall squared error; boundary-censored curves account for another
-35.89%. The evidence points beyond an onset-only explanation, toward post-peak
-and difficult-geometry tails. Observed maxima and angle bins are diagnostics, not
-measurements of physical stall or separation.
-
-### Condition-matched reference
-
-| CPU Huber test subset | rows | airfoils | Cd median relative error | Cd mean relative error |
-|---|---|---|---|---|
-| pooled | 116,484 | 123 | 5.57% | 9.02% |
-| `|Alpha| <= 12`, `Ncrit=9`, all Re | 45,555 | 123 | 6.21% | 9.78% |
-| same conditions, fixed `Re=1e6` | 9,360 | 123 | **6.44%** | **11.17%** |
-
-The selected no-weight-decay trial scores **6.33% median / 11.51% mean** on that
-same fixed-Re subset: the median improves slightly, but the mean worsens.
-
-Re=1e6 was fixed in advance, not selected for the lowest test error. NeuralFoil's
-0.37% is a **mean**, not a median, and its data, case split and averaging differ.
-Matching these conditions improves reporting but does not make the experiments
-directly equivalent. The geometry correction provides validity and interpretability;
-the measured MLP gain must not be attributed to that correction alone.
-
-The CPU-reference diagnostics were recomputed with saved NumPy weights, without
-fitting or Torch. A local sklearn scaler-version warning was emitted; its pooled
-drag metrics agree with the original CPU cloud report within 6e-8. Reproduce into
-a new output file:
-
-```bash
-python -m src.training.analysis <completed-run-dir> --output <completed-run-dir>/diagnostics.json
-```
-
-## The v1 geometry caveat
-
-`src/geometry/representation.py` used to normalize the upper and lower surfaces
-**independently**, and each normalization subtracted that surface's own mean `y`:
-
-```python
-coordinates[:, 1] -= coordinates[:, 1].mean()   # the bug, applied per surface
-```
-
-Two offsets per airfoil were discarded, and the difference between them is exactly what
-sets thickness. Measured on the v1 processed dataset:
-
-- **43% of sampled stations had the upper surface below the lower one** — negative
-  thickness, which is physically impossible.
-- **Every airfoil** had negative thickness somewhere.
-- Both surfaces' mean `y` sat at ~0.003, the signature of independent centering.
-- The leading and trailing edges failed to close, by up to 0.52 chord.
-
-Thickness and camber were therefore **unrecoverable** from v1's `geom_000..geom_099`
-features, and the offsets are not stored anywhere, so the old processed CSV could not be
-repaired — only regenerated.
-
-v1 still scored well (test `Cl` R² = 0.977), so its distorted coordinates retained
-predictive structure despite not being valid physical geometry. Its geometry-disjoint
-test score cannot be explained by memorizing those held-out airfoils. Correcting the
-representation establishes physical validity and interpretability, but does not by
-itself establish an accuracy gain. **State the representation caveat when comparing
-v1 and v2.**
-
-### What v2 does instead
-
-- Chord is taken from the **combined** point set, never per surface.
-- Both surfaces are rotated, translated, and scaled by **one shared transform**, so the
-  chord line runs from `(0, 0)` to `(1, 0)`.
-- `y` is **never** mean-centered.
-- Both surfaces are sampled on a **shared, cosine-spaced** `x` grid, which resolves the
-  high-curvature leading edge that uniform spacing under-samples.
-- Geometry is stored as a physical **thickness/camber** basis (`y_upper = camber + t/2`),
-  a lossless reparametrization that is far better conditioned, plus named scalar
-  descriptors: max thickness and its `x`, max camber and its `x`, leading-edge radius,
-  trailing-edge angle and thickness, and enclosed area.
-- Source coordinates that cross are clipped to zero thickness and **counted** in
-  `load_report.json`, rather than silently absorbed. The raw archive has a few artifacts
-  of order 1e-4 chord, mostly in the Drela AG series.
-
-The descriptors are checked against analytic NACA four-digit sections, for which
-thickness, camber, and leading-edge radius (`r = 1.1019 t²`) are known in closed form.
-
-## Dataset
-
-The source is the [NASA Airfoil Learning Dataset](https://github.com/nasa/airfoil-learning):
-825 JSON members under `json/`, one airfoil per document, with `name`, `xss`/`yss`
-(suction/upper), `xps`/`yps` (pressure/lower), and a `polars` list.
-
-| field | observed |
+| Available | Not yet qualified or automated |
 |---|---|
-| airfoils | 825 documents; **818** contribute rows (7 have no usable polars) |
-| rows | 768,542 operating conditions |
-| `Alpha` | −19.75 … 24.25°, 177 distinct; ~17% of rows are \|Alpha\| > 12 (post-stall) |
-| `Re` | **8 distinct values**, 5e4 … 5e6 |
-| `Ncrit` | **4 distinct values**: 0, 1, 5, 9 |
-| `Cl` | −2.29 … 2.51 |
-| `Cd` | 0.00265 … 0.59 — a **223×** range |
-| `Cm` | fully populated, zero NaNs |
+| Geometry-derived features and Cl/Cd/Cm regression models | A calibrated prediction-time acceptance/referral policy |
+| Portable NumPy inference from saved neural models | Guaranteed error bounds or confidence percentages |
+| Geometry-disjoint development folds and paired experiments | An end-to-end surrogate-plus-CFD service or measured solver speedup |
+| Raw clipping, ensemble disagreement, geometry-support, and offline risk/coverage diagnostics | A validated surrogate pressure-distribution output |
+| Reproducible source snapshots, saved predictions, and audit receipts | Automatic production promotion of the latest experimental models |
 
-The loader emits **two tables** joined on `geometry_id` instead of one monolithic CSV,
-because geometry is constant per airfoil and v1 repeated 100 columns across all 768k rows:
+The models can provide research screening estimates. Low disagreement or proximity
+to training shapes is not, by itself, evidence that a prediction is accurate.
+Historical model decisions and the pinned reference remain unchanged.
 
-| file | rows | size |
-|---|---|---|
-| `data/processed/airfoil_geometry.csv` | 818 | 1.7 MB |
-| `data/processed/airfoil_polars.csv` | 768,542 | 55 MB |
-| `data/processed/load_report.json` | — | conversion provenance |
+## Approach
 
-That is a 57 MB upload instead of 1.7 GB — about 30× smaller — which matters every time a
-Kaggle session restarts. `src/data/features.py` joins them back into a design matrix in
-memory (113 features; ~490 MB for the training partition in float64). Large data files are
-ignored by Git.
+1. **Validate the request.** Check geometry, units, coefficient conventions, and
+   operating-condition scope. Invalid geometry is not made valid by low uncertainty.
+2. **Batch predictions.** Reuse geometry features across operating points and cache
+   appropriate computations. Model inputs are shape and flow features, not airfoil IDs.
+3. **Assess applicability.** Combine whole-profile similarity, camber/thickness and
+   other descriptors, operating conditions, raw numerical diagnostics, and ensemble
+   information. The acceptance rule must be calibrated and independently evaluated.
+4. **Retain or refer.** Qualified estimates support fast screening. Uncertain cases
+   are deferred for reference evaluation, not silently dropped or declared bad designs.
+5. **Use existing data first.** Seek suitable published polars, measurements, or CFD
+   for the exact geometry and required conditions before considering a new simulation.
+6. **Validate decisions.** Important finalists need appropriate reference confirmation;
+   an optimizer or ranking procedure can exploit surrogate errors.
 
-## Methodology
+The automatic routing part is a target workflow, not an already validated capability.
+Known difficult airfoils remain in evaluation. We do not improve reported accuracy by
+removing them, nor assume a name-based blacklist will generalize to new geometries.
 
-**Features.** The thickness/camber profile and the scalar descriptors, plus flow features:
-`Alpha`, `sin(Alpha)`, `cos(Alpha)`, `log10(Re)`, and `Ncrit`. `log10(Re)` is used because
-the eight Reynolds numbers span two decades and raw values standard-scale poorly;
-`sin(Alpha)` is used because thin-airfoil theory gives `Cl ≈ 2π sin α`, a relationship a
-linear model cannot express from degrees alone. `Alpha` is kept in degrees alongside its
-sine and cosine so tree models can split cleanly on the post-stall boundary.
+## Current Results
 
-`geometry_id` is never a feature — it defines the split groups, so including it would leak
-precisely the thing the unseen-geometry claim rests on.
+The latest selective-floor Cdp ensemble was evaluated on **538,380 out-of-fold rows
+covering 572 canonical-training geometries**. Every row was evaluated once per ensemble;
+the original canonical validation/test partitions were not scored by this study.
 
-**Targets.** `Cl`, `Cd`, and `Cm`. `Cd` is fitted as `log(Cd)` and inverted for reporting,
-so a squared loss stops being dominated by high-drag stalled cases. Every metric is
-computed in **physical** coefficient units; `src/training/targets.py` enforces this
-structurally rather than leaving it to notebook discipline.
+| Target | Pooled OOF R² | RMSE | Median relative error |
+|---|---:|---:|---:|
+| Cl | 0.9873 | 0.08479 | 4.32% |
+| Cd | 0.8983 | 0.009512 | 6.11% |
+| Cm | 0.9245 | 0.01375 | 9.73% |
 
-**Split.** Geometry-disjoint, by `GroupShuffleSplit` on `geometry_id`, so every operating
-condition for one airfoil stays in exactly one partition. Row-wise random splitting would
-leak geometry-specific information and overstate generalization.
+These are full-population development scores, not accuracy guarantees or percentages
+of trustworthy predictions. The candidate has no observed inverse-limit clipping,
+but fails a frozen worst-geometry drag regression check. It was not promoted.
 
-v2 **reuses v1's exact partitions**, committed to `configs/frozen_split.json`
-(572 / 123 / 123 geometries), so the held-out airfoils are identical and the comparison is
-honest. A new dataset fingerprint is recorded for the v2 tables; the leakage assertions
-(disjoint, unique, exact coverage) are re-checked on every load.
+The offline referral analysis illustrates both opportunity and limitations: retaining
+95% of rows by a combined input-support/disagreement ranking reduces retained Cd RMSE
+to **0.00723**. However, about **30.3% of those retained rows exceed an illustrative
+10% Cd-error budget**. Retained coverage is not confidence, and these inspected data
+do not validate an operational gate. See [validation and reliability](docs/validation.md).
 
-**Scalers** are fitted on training features only.
+## Data And Scope
 
-**Metrics** are reported per target: MAE, RMSE, R², and mean/median absolute relative
-error. Read the **median** relative error in preference to the mean, since rows whose
-actual value is near zero — common for `Cl` near zero lift — dominate the mean.
+- Source: the NASA `airfoil-learning` archive, with XFOIL-associated AirfoilTools polars.
+  These labels are not automatically experimental or CFD ground truth.
+- **825 source cases**, of which **818** contribute the **768,542** processed rows.
+  Seven source cases without usable polars still count as belonging to the dataset.
+- Geometry uses a shared chord transformation and sampled thickness/camber profiles,
+  plus scalar descriptors. The current input has **113 features**, including angle
+  features, log Reynolds number, and Ncrit.
+- Geometry is nondimensionalized by chord. Dimensional chord is reference metadata
+  and contributes through Reynolds number; it is not an independent learned feature.
+  The model has no independent Mach input and does not establish compressible,
+  three-dimensional, or unsteady-flow validity.
+- Cdp is experimental auxiliary supervision, not an input or a pressure-field output.
+  The public primary quantities are Cl, Cd, and Cm.
+- Geometry-ID separation is not a guarantee that every related shape family or near
+  duplicate is withheld. Current development folds have also been repeatedly inspected.
 
-**Evaluation depth.** `src/training/analysis.py` reports per-geometry error distributions,
-a pre/post-stall split at |Alpha| > 12°, a per-Reynolds breakdown, the worst-case airfoils
-by name, and `L/D` error, which amplifies drag error and is what a designer actually
-compares sections on.
+## Cloud-First Execution
 
-## Models
+Training, experiments, computational analysis/validation, and simulations should be
+attempted on cloud resources first. Local compute is a fallback only after cloud
+execution is found infeasible or unsuitable and the reason is documented. Repository
+editing, inspection, orchestration, and cleanup remain local work.
 
-CPU-compatible scikit-learn factories remain available: Linear Regression, Polynomial
-+ Ridge, Random Forest, Histogram Gradient Boosting, and an MLP. The published v2 queue
-is preserved in `DEFAULT_MODEL_CONFIGS`.
+Kaggle is the established ML execution path; cloud CPU is sufficient for fit-free
+tests and offline analysis. Physics jobs may need a more suitable persistent cloud
+runtime. OpenFOAM locally is a fallback, not the default next step.
 
-The Kaggle notebook now uses `ACCURACY_MODEL_CONFIGS`: the original MLP baseline plus
-two otherwise-identical CUDA MLPs with MSE versus Huber loss. Inspired by NeuralFoil:
-
-- SiLU layers and RAdam with small weight decay, without dropout or batch normalization.
-- Internal `sin(2 Alpha)` and `sin²(Alpha)` features for separated-flow trends. The
-  original baseline still receives exactly its published 113 features.
-- Exact reflection symmetry: thickness unchanged, camber and angle negated; `Cl` and
-  `Cm` odd, `log(Cd)` even. Symmetry is applied during training and inference, with
-  target-scaling offsets handled in fitting-space units.
-- Huber delta 0.05 **after** training-only standardization of `Cl`, `log(Cd)`, `Cm`.
-  Our configurable target weights `(1, 2, 0.5)` prioritize drag; they are experiment
-  choices, not numerical ratios quoted from the paper.
-- Up to 300 epochs, learning-rate reduction, and restoration of the best
-  **geometry-disjoint validation** checkpoint. Test targets never enter fitting,
-  scheduling, stopping, or winner selection.
-
-The baseline actually stopped at **58 epochs** with `tol=1e-4` and no convergence
-warning. Raising `max_iter` alone would not change that stopping criterion.
-
-Models train sequentially and checkpoint before the next starts. The notebook selects
-drag on validation **median relative error**, and lift/moment on physical-unit RMSE.
-All selection criteria are recorded; the generic comparison API retains RMSE defaults.
-Saved neural weights and inference use NumPy, so pulling a model does not require
-installing PyTorch locally.
-
-Full quadratic expansion is deliberately excluded from the queue: ~113 inputs expand to
-thousands of features, tens of gigabytes for one float64 training matrix at 538k rows.
-
-The completed v2 benchmark held hyperparameters fixed. The initial accuracy experiment
-changed physics features, architecture, optimizer, and stopping together versus that
-baseline; only the MSE/Huber pair isolates a single intervention. The subsequent
-three-seed study supports the median-error benefit of Huber, but also exposes drag
-tail instability. It does not isolate the geometry correction from the other changes.
-
-Every neural result records `training_metadata` in its trial `run.json`: `device`,
-`device_name`, seed, `n_iter`, `max_iter`, `best_epoch`, stop reason, and restored-best
-checkpoint status. Run-level `machine_shape` is the requested API shape (`null` means
-automatic), not evidence of allocation; `gpu.device_name` records actual hardware.
-Run-level `inference_device` is `cpu-numpy`. Selecting a GPU never changes the frozen
-split or moves reported inference onto CUDA.
-
-## v1 baseline, for reference only
-
-Validation scores on the geometry-disjoint split (train 572 / validation 123 / test 123
-geometries; 538,380 / 113,678 / 116,484 rows):
-
-| model | Cl R² | Cd R² | train s |
-|---|---|---|---|
-| linear | 0.916 | 0.119 | 7.7 |
-| gradient_boosting | 0.980 | 0.878 | 173 |
-| random_forest | 0.969 | 0.875 | 1000 |
-| **mlp** (selected) | **0.987** | **0.921** | 388 |
-
-Frozen-winner test: `Cl` R² = 0.977, `Cd` R² = 0.926.
-
-Two caveats. The representation was physically invalid, as described above; that alone
-does not prove inflated geometry-disjoint scores. And MAE 0.0049
-against a 1st-percentile `Cd` of 0.006 is roughly an **80% relative error** on low-drag
-cruise airfoils. Reporting relative error alongside absolute is why v2 adds it.
-
-## Installation
-
-Python 3.10 or newer.
+Portable dependencies are in `requirements.txt`; cloud fitting additionally uses
+`requirements-kaggle.txt`. Python 3.10+ is supported; 3.12 is used in the validated
+workflow. In a prepared cloud runner:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate && python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -m 'not gpu and not cloud_fit'
+python -m src.training.reliability_analysis --help
 ```
 
-## Usage
+Real fitting tests have separate Kaggle opt-in guards. These guards do not make local
+execution the preferred policy. Do not install or import local PyTorch merely to
+inspect portable model outputs.
 
-### 1. Build the two tables locally
-
-```bash
-python -m src.data.loaders
-```
-
-Downloads the archive to `data/raw/` if absent, converts it, and writes both tables plus
-`load_report.json`. The report records the airfoils with no usable polars, skipped polar
-records, corrected surface swaps, and the clipped-thickness count. Validate a table with:
+The local driver can inspect and retrieve an existing cloud job:
 
 ```bash
-python -m src.data.validation --data data/processed/airfoil_polars.csv
-```
-
-### 2. Push the tables to Kaggle
-
-Requires the `kaggle` CLI and Kaggle credentials, such as a token file or
-`~/.kaggle/kaggle.json`.
-
-```bash
-python -m src.utils.kaggle_sync push <owner>/<dataset-slug> --create
-```
-
-Use `--create` only the first time; later runs omit it to add a new version. Only the two
-tables and the report are uploaded — never the raw archive or model weights.
-
-### 3. Create and run the notebook on Kaggle
-
-The API helper embeds an allowlisted snapshot of the current training source, tests,
-requirements, and frozen split in the staged notebook. **No Git commit or GitHub push
-is needed to run uncommitted changes.** Data, credentials, local state, and model
-weights are excluded. A SHA256 of the exact source archive is recorded in `run.json`,
-alongside the base Git revision. Browser-only execution retains the Git clone fallback.
-
-Everything else is CLI-able. Pushing a kernel is what *starts* a run; there is no separate
-run verb. Pushing an existing slug creates another version and **does not cancel an
-older queued or running version**. Check existing jobs first to avoid duplicate GPU slots:
-
-```bash
-python -m src.utils.kaggle_sync kernel <owner>/<kernel-slug> --dataset <owner>/<dataset-slug>
 python -m src.utils.kaggle_sync status <owner>/<kernel-slug>
-```
-
-This generates `kernel-metadata.json`: **GPU on by default**, internet on for Kaggle-only
-dependencies, the tables dataset attached, and a private notebook unless `--public` is
-passed. Optional `--machine-shape NvidiaTeslaT4` records a requested T4 shape; older
-Kaggle CLI versions can ignore this metadata field. With no shape, Kaggle chooses the
-GPU. The notebook checks CUDA and records the actual device separately from the request. It never
-silently trains GPU candidates on CPU. `--accelerator cpu` explicitly runs the same
-accuracy candidates on Kaggle CPU after cloud-only CPU fitting tests. It can be used
-when GPU allocation is queued, but training will be slower. `requirements-kaggle.txt`
-is installed on Kaggle, not locally.
-
-Equivalently, in the browser: **Add Input → Datasets** → attach the dataset,
-**Settings → Internet: On**, select an available **GPU accelerator**, then
-**Save Version → Save & Run All**. Browser execution needs the source branch pushed.
-
-The notebook extracts the snapshot into Kaggle scratch (not `/kaggle/working`, which
-becomes the kernel output), restores the frozen split, trains the queue, evaluates the frozen
-winners on the test split, and writes metrics, `analysis.json`, and figures.
-The report also separates within/outside training descriptor ranges, matched pre-stall
-`Ncrit=9` cases by Reynolds number, per-airfoil error distributions, and squared-error
-concentration. Descriptor ranges are a diagnostic heuristic, not calibrated uncertainty.
-
-### 4. Pull the results back
-
-```bash
 python -m src.utils.kaggle_sync pull <owner>/<kernel-slug>
 ```
 
-Each pull lands in its own `results/kaggle/<run-id>/` and never overwrites an existing run.
-
-### Controlled study
-
-```bash
-python -m src.utils.kaggle_sync kernel <owner>/<study-slug> --dataset <owner>/<dataset-slug> --accelerator gpu --study
-```
-
-Use one fresh study slug. The API reuses the tested notebook bootstrap and then hands
-off to the cloud-only study runner, without executing the ordinary test-report cells.
-The design is declared before fitting:
-
-- Seeds 42, 43, 44 with paired MSE/Huber models and the same frozen geometry split.
-  Report every seed and sample mean/standard deviation, never the best test seed.
-- Huber deltas 0.02, 0.05, 0.1 at weight decay 1e-5, and weight decays 0, 1e-5,
-  1e-4 at delta 0.05. This is a one-factor-at-a-time, seed-42 sweep, not a full grid.
-  Reuse the central seed-42 Huber fit; select by validation median drag error.
-- A separately labeled Torch leakage diagnostic, constructed only from canonical
-  training airfoils. Both arms share fixed audit rows and a common disjoint stopping
-  set. The exposed arm replaces training rows with other operating points from audit
-  airfoils, preserving row count and excluding the actual audit observations.
-
-Production choices are frozen before canonical test evaluation. The intentionally
-exposed arm never influences production selection. A three-seed study measures
-initialization variability on this split; it does not replace new geometry folds.
-
-### Cdp auxiliary study
-
-This completed experiment takes the additional `Cdp` target from
-[NASA's training code](https://github.com/nasa/airfoil-learning/blob/f211e62fab6be125657d49c58fdce1bdeb0d12a8/pytorch/train_dnn.py),
-not its row-random split or full-data scaling. It compares our unchanged three-output
-Huber model against the same model with an internal auxiliary Cdp head.
-
-The audited sidecar covers **all 768,542 existing rows**, with no duplicate keys,
-unmatched operating points, missing labels, or imputation. Two Cdp values are
-negative (minimum -0.00108), so the auxiliary target uses **identity space**, not
-a logarithm. `Cd - Cdp` is positive throughout the audited data. This is a label
-consistency check, not a guarantee of XFOIL accuracy on extreme geometries.
-
-```bash
-python -m src.data.auxiliary
-python -m src.utils.kaggle_sync push <owner>/<new-cdp-dataset> --create --include-auxiliary
-python -m src.utils.kaggle_sync kernel <owner>/<cdp-study> --dataset <owner>/<new-cdp-dataset> --accelerator gpu --auxiliary-study
-```
-
-Use a **separate dataset**, leaving the original two tables, their hashes, and the
-pinned reference untouched. The optional upload adds only `airfoil_auxiliary.csv`
-and `auxiliary_report.json`. Dataset and source staging reject nonempty destinations;
-personal reports, credentials and raw archives are excluded by explicit allowlists,
-not merely by `.gitignore`.
-
-The fixed experiment consists of **12 fits**, with clear phase/seed/arm progress:
-
-- Six development fits: baseline versus auxiliary weight 0.1, seeds 42/43/44.
-  Only canonical training geometries are partitioned into fit, stopping, and
-  evaluation sets (80/10/10; partition seed 20261020).
-- A development-only eligibility decision is saved before production validation
-  or test scoring. No best-seed selection is allowed.
-- Six confirmation fits: both predeclared arms and all three seeds on the full
-  canonical training partition, with the original validation set for stopping.
-  Test results audit the frozen decision; they never rewrite it.
-
-Cdp is a **label only** and never joins the 113 input features. The public predictor
-still returns Cl, Cd and Cm; auxiliary predictions are separate. The baseline trunk,
-primary-head initialization, primary target scalers, and primary loss denominator
-are preserved. With H denoting Huber loss in training-standardized target units:
-
-```text
-primary loss = (H(Cl) + 2 H(log(Cd)) + 0.5 H(Cm)) / 3.5
-auxiliary training loss = primary loss + 0.1 H(Cdp)
-```
-
-Only observed auxiliary labels contribute. Scheduling and stopping monitor the
-**same primary validation loss** for both arms; improving Cdp alone cannot extend
-training or select a checkpoint. Auxiliary validation loss is logged diagnostically,
-not used for stopping or eligibility. The 0.1 weight is a declared experiment choice,
-not a numerical ratio claimed by NASA.
-
-The new paired development gate supplements the original median-only CI guard:
-
-- Mean median relative error may worsen by at most 0.5 percentage points for each
-  primary target; mean drag median error must improve.
-- Mean physical Cd RMSE, p95 and worst-airfoil RMSE, and low-Re/thick-airfoil stress
-  RMSE may worsen by at most 5%.
-- Each paired seed's pooled and worst-airfoil Cd RMSE may worsen by at most 10%.
-- Stress boundaries come only from fitting data: the lowest observed Re and the
-  90th percentile of unique-airfoil thickness. Missing stress evidence or incomplete
-  seeds make a gate inconclusive, never a pass.
-
-These tolerances are **predeclared engineering policies**, not statistical confidence
-limits or physical guarantees. A failure retains the baseline as the development
-choice; neither a passing gate nor the experiment automatically changes production
-defaults. The existing test has already been inspected, so confirmation is not a
-new blind benchmark.
-
-**Measured outcome:** run `20261020T104928953059Z` completed all 12 fits on a Tesla
-T4 in approximately 26 minutes. Cloud preflight passed **704 tests** (six skipped,
-one deselected). The successful notebook source is `07142df`; the earlier precision
-assertion and notebook-path failures occurred before study fitting and did not
-change the model settings, data, or gate thresholds.
-
-On the 57-airfoil training-only development evaluation, mean median errors were:
-
-| target | baseline | with Cdp |
-|---|---|---|
-| `Cl` | 8.797% | 7.597% |
-| `Cd` | 11.510% | 8.976% |
-| `Cm` | 24.265% | 19.971% |
-
-Mean development Cd RMSE decreased from 0.01491 to 0.01091, and all development
-checks passed. `auxiliary_selection.json` therefore froze the Cdp arm **before**
-canonical validation or test scoring. This decision has not been rewritten.
-
-The full-data confirmation results are the mean and sample standard deviation of
-test median relative error across seeds 42/43/44, in percent:
-
-| target | baseline | with Cdp |
-|---|---|---|
-| `Cl` | 3.834 +/- 0.017% | 3.790 +/- 0.011% |
-| `Cd` | 5.612 +/- 0.065% | 5.550 +/- 0.094% |
-| `Cm` | 10.124 +/- 0.451% | 10.022 +/- 0.357% |
-
-The three confirmation baselines reproduce the prior GPU Huber run's 45 reported
-test scores and stored weights/scalers exactly. Recomputed development and test
-gates also match the saved decisions, supporting the intended paired comparison.
-
-Average Cd RMSE decreased from **0.02290 to 0.01407**, helped substantially by
-correcting the previous seed-44 failure. The worst of the three seed-level Cd RMSEs
-also improved, from 0.04159 to 0.02133. However, paired improvement was not uniform:
-
-| seed | baseline Cd RMSE | Cdp Cd RMSE | baseline Cd R² | Cdp Cd R² |
-|---|---|---|---|---|
-| 42 | 0.01157 | 0.00908 | 0.8760 | 0.9237 |
-| 43 | 0.01553 | 0.02133 | 0.7766 | 0.5784 |
-| 44 | 0.04159 | 0.01180 | -0.6021 | 0.8710 |
-
-The paired test-tail audit failed three unchanged limits:
-
-- Mean p95 airfoil Cd RMSE increased from **0.01227 to 0.01313**, about **7.1%**,
-  exceeding the 5% allowance.
-- Seed 43's pooled Cd RMSE increased about **37.4%**, exceeding the 10% allowance.
-- Seed 43's worst-airfoil Cd RMSE increased from **0.14714 to 0.21420**, about
-  **45.6%**, exceeding the 10% allowance.
-
-Mean Cl RMSE also increased from 0.10781 to 0.12292, and mean Cm RMSE from 0.01472
-to 0.01647. Those regressions must not be hidden behind slightly better medians.
-The original median-only guard passes the predeclared seed-42 Cdp candidate against
-the pinned CPU reference (Cl -0.0223 pp, Cd +0.0763 pp, Cm +0.0276 pp), but that does
-not override the failed paired tail audit.
-
-**Decision:** retain the existing baseline; do not promote the auxiliary model or
-select a favorable seed. Cdp supervision is promising on average, but this result
-does not meet our predeclared reliability criteria. This was one development
-geometry partition with three initialization seeds, not three geometry folds.
-The next priority is additional training-only geometry folds and validation of
-seed-disagreement/ensemble behavior, not relaxing the limits or tuning on the
-known test failures. No further training sweep was automatically launched.
-
-Evidence is preserved under
-`results/kaggle/cdp-study-v3/experiments/v2/20261020T104928953059Z/`, including the
-immutable selection, all per-seed reports, `summary.csv`, and `tail_audit.json`.
-The successful source archive SHA256 is
-`4453ecf7c00cef238466d7732b8215990c9902d8a759e89051a35a1ae5999ccf`.
-
-### Geometry-fold and ensemble study
-
-The next bounded experiment uses **only the original 572 training airfoils**.
-Canonical validation and test are checked for identity/coverage but are never
-passed to model fitting, stopping, scoring, or selection in this study.
-
-```bash
-python -m src.utils.kaggle_sync kernel <owner>/<fold-study> --dataset <owner>/<cdp-dataset> --accelerator gpu --fold-study
-```
-
-The existing private Cdp dataset is reused, without uploading the raw archive or
-personal reports. The original 113 features, Huber training settings, and auxiliary
-weight 0.1 remain fixed; this experiment does not add pressure supervision or change
-geometry resolution.
-
-- Three deterministic geometry-ID folds use partition seed 20261026. Evaluation
-  groups contain 191, 191, and 190 airfoils and together cover every training ID.
-- Within each fold, 38 remaining airfoils form a shared stopping set; the inner fit
-  contains 343, 343, or 344 airfoils. Fit/stopping/evaluation are disjoint within a
-  fold. All membership and original row positions are saved before fitting.
-- **18 fresh fits**: three folds x three seeds (42/43/44) x baseline/Cdp arms.
-  Reusing old full-training models here would leak the fold evaluation geometries,
-  so those models are not used. Progress logs show the fold and global fit count.
-- Each fold's three members form an ensemble without extra fitting: arithmetic
-  mean for Cl/Cm, geometric mean for positive Cd. One aggregation rule is declared
-  before evaluation, not chosen by trying different rules on the test set.
-- The fixed reference is **baseline seed 42**, never the best seed. Candidate
-  families are the baseline ensemble and the Cdp ensemble. Eligibility is assessed
-  across all folds; eligible families are ranked by equally weighted mean fold Cd
-  median error, with baseline-ensemble tie preference and seed-42 fallback.
-
-The numerical tolerances remain 0.5 percentage points for mean primary median
-error, 5% for mean Cd tail/stress metrics, and 10% for each fold's pooled/worst-airfoil
-Cd RMSE. Before this experiment, **mean Cl and Cm RMSE are additionally constrained
-to at most 5% deterioration**, to prevent the negative-transfer pattern seen in the
-Cdp study. This is a new fold-study requirement, not a retroactive change to the
-previous study's recorded gate. Fold IDs are not misrepresented as random seeds.
-
-Disagreement is the three-member sample standard deviation in Cl/log(Cd)/Cm.
-Reports compare its rank correlation with observed log-drag error and show all rows
-in fixed low/mid/high spread bins (prediction-only p50/p90 boundaries). This is not
-calibrated uncertainty, a confidence interval, an abstention guarantee, or a reason
-to drop difficult observations. Folds share training data; their variation is
-descriptive and is reported separately from seed variation within each fold.
-
-Outputs include `folds.json`, `fold_rows.csv`, member/ensemble metrics, disagreement
-diagnostics, `gates.json`, and an immutable `fold_selection.json`. Any choice is a
-development recommendation only: fresh full-training fitting and a locked assessment
-would be needed later. Defaults and the pinned reference are not changed, and no
-improvement on the old test set is claimed. This is geometry-ID-held-out evaluation,
-not a guarantee of withholding every related airfoil family.
-
-### Unused-data audit
-
-A non-fitting audit on **training geometries only**, performed on 26 October 2026,
-found all **538,380 training operating points** have finite numeric `Cp_ss` and
-`Cp_ps` arrays, each with 100 entries. They match the stored surface-array lengths.
-All 1,144 training surface coordinate arrays use a common **uniform 100-point x
-grid**, not the cosine grid used by the current model representation. Equal array
-length is not, by itself, evidence of physical consistency with the scalar labels.
-
-The pressure values require further scrutiny before supervision:
-
-| diagnostic flag | training rows | training airfoils |
-|---|---:|---:|
-| any Cp > 2 | 2,408 | 7 |
-| any abs(Cp) > 10 | 12,522 | 324 |
-| any abs(Cp) > 100 | 842 | 1 |
-
-Global training Cp extrema are **-1585.04 and +1451.85**. Values with magnitude above
-10 occur only at stored indices 0 or 1, concentrated at the leading endpoint.
-The most extreme examples belong to training airfoil S9037. These are screening
-flags, not automatic exclusions: a source/interpolation problem is a hypothesis
-to verify, and large suction alone is not proof of an invalid label. No values were
-clipped, no rows removed, and Cp was not introduced into training. These unused
-pressure values cannot be the direct cause of the existing coefficient-model errors.
-
-The same audit reconstructed geometry at 1,001 cosine-spaced chord locations from
-50 versus 100 sampled stations. The reference was the normalized source surfaces,
-linearly interpolated with the same nonnegative-thickness rule. Errors are **chord
-fractions**, not coefficient errors:
-
-| geometric statistic across training airfoils | 50 stations | 100 stations |
-|---|---:|---:|
-| median thickness RMSE | 1.559e-4 | 7.321e-5 |
-| p95 of maximum thickness deviation | 2.715e-3 | 2.211e-3 |
-| median camber RMSE | 2.781e-5 | 9.176e-6 |
-
-The stored 50-station features reproduce the conversion to within 1e-16. Increasing
-the station count reduces interpolation error, but the largest deviations remain
-near the nose and extra stations cannot restore detail already absent from the raw
-uniform grid. This audit does not establish an aerodynamic accuracy gain from higher
-resolution. The temporary audit script was removed; no model fitting or local Torch
-installation was performed.
-
-### Testing
-
-```bash
-python -m pytest tests/test_kaggle_sync.py tests/test_kaggle_notebook.py tests/test_analysis.py tests/test_torch_mlp.py -m 'not gpu'
-python -m pytest tests/test_accuracy_guard.py tests/test_study.py
-python -m pytest tests/test_auxiliary.py tests/test_tail_risk.py tests/test_auxiliary_study.py
-python -m pytest tests/test_ensemble.py tests/test_fold_gate.py tests/test_fold_study.py
-```
-
-The full suite, including model fitting, runs in the Kaggle notebook preflight. The
-local command above checks portable inference and integration without fitting.
-GPU fitting and full notebook integration tests are opt-in on Kaggle; portable inference,
-configuration, transfer, and numerical checks run without local PyTorch. Covers corrected
-normalization (non-negative thickness, edge closure, chord scaling,
-invariance to rotation/scale/translation/point order), descriptors against analytic NACA
-geometry, the two-table loader, feature assembly and leakage guards, the target-transform
-round trip, the new metrics, the frozen-split guards, the Kaggle transfer tool, and an
-end-to-end run of the Kaggle notebook against synthetic tables.
-
-### Accuracy regression guard
-
-`configs/accuracy_baseline/` pins the CPU Huber test CSV and matching provenance.
-The guard rejects inconsistent or incomplete reports, different data fingerprints,
-different geometry splits, missing targets/counts, and unrecorded hardware/stopping.
-It fails if **any target degrades by more than 0.5 percentage points** in median
-relative error (`0.005` in the stored fractions). Improvements are allowed.
-
-```bash
-python -m src.utils.accuracy_guard --candidate-dir <completed-run-dir> --tolerance-pp 0.5
-```
-
-The existing automatic-GPU run passes: relative to CPU, median-error changes are
-Cl **+0.000605 pp**, Cd **+0.000699 pp**, Cm **+0.001285 pp**.
-The completed sweep winner also passes, despite the RMSE regression documented
-above. This guard covers typical relative error only; tail checks remain necessary.
-
-`.github/workflows/accuracy.yml` runs fit-free checks on push/PR. Its manual
-`workflow_dispatch` accuracy job downloads a **completed** trusted Kaggle comparison
-and requires its kernel, exact run ID, expected source-bundle SHA256, and source
-commit (defaults to the workflow commit). Configure `KAGGLE_API_TOKEN` as a repository
-secret. It retains exact reports and a receipt; downloaded code/weights are not run.
-This does **not** train on GitHub or pretend unit tests measure a refactor's new model
-accuracy: a completed Kaggle candidate and dispatch are required for that check.
-Study test trials also emit standard reports. Use the `selected_trial` recorded in
-`study_selection.json` for the sweep candidate, not whichever test trial looks best.
-
-### Progress report
-
-`Minor_Project_Progress_Report.docx` contains the latest results and three embedded
-plots in **three total pages**, including the student details and references. The
-page count and layout were checked by rendering with LibreOffice 26.8.1; the PDF
-proof is in `results/kaggle/controlled-study-v2/report-render/`.
-The personal report is kept locally and ignored by Git to prevent future commits.
-
-The original report is preserved in
-`results/kaggle/controlled-study-v2/report-backup.docx`; the separate `docs/` copy
-is unchanged. The one-off generation tools and temporary renderer were removed
-after validation; opening the final DOCX requires no additional project dependencies.
-
-## Repository Structure
-
-```text
-configs/config.yaml                 Reproducible parameters and paths
-configs/frozen_split.json           The geometry-disjoint partitions, reused by v2
-data/raw/                           Downloaded archive, ignored by Git
-data/processed/                     The two generated tables, ignored by Git
-src/data/loaders.py                 Archive -> geometry + polars tables
-src/data/features.py                Flow features and design-matrix assembly
-src/data/preprocessing.py           Grouped splitting, frozen splits, train-only scaling
-src/data/validation.py              Tabular and geometry validation
-src/geometry/representation.py      Shared-transform normalization, thickness/camber
-src/geometry/descriptors.py         Physical scalar descriptors
-src/geometry/naca.py                NACA four-digit generation (analytic ground truth)
-src/models/                         Model factories
-src/training/comparison.py          Sequential queue on the frozen split
-src/training/targets.py             Per-target transforms, physical-unit reporting
-src/training/analysis.py            Regime, Reynolds, per-geometry and L/D breakdowns
-src/training/{train,evaluate}.py    Fitting and scoring APIs
-src/utils/metrics.py                Absolute and relative error
-src/utils/kaggle_sync.py            Push tables to / pull results from Kaggle
-src/visualization/                  Plot helpers
-notebooks/                          The Kaggle experiment runner
-results/kaggle/                     Pulled run outputs, ignored by Git
-tests/                              Unit tests
-```
-
-## Limitations and Next Steps
-
-- Three seeds support Huber's typical-error gain, but its drag RMSE/R² vary severely
-  on the same test set. Address out-of-range geometry and low-Re tails before claiming
-  a generally reliable surrogate; do not hide them by removing test airfoils.
-- `Cdp`, `Cp_ps`/`Cp_ss` (100-point pressure distributions), and the `alpha_min`/`max`/
-  `step` fields are present in the archive and unused.
-- The leading-edge radius is fitted from the vertical thickness distribution, so for a
-  strongly cambered section it runs above the radius measured normal to the camber line.
-  It remains a monotonic, physical feature; it is not a certified nose radius.
-- More seeds for the sweep winner, geometry-fold evaluation, additional extreme
-  geometries, and XFOIL panel-resolution label-noise checks remain future work. A
-  longer-patience study and explicitly specified tail-regression thresholds have not
-  been run or adopted. The frozen test was
-  inspected for diagnosis; new folds or new airfoils are needed for stronger confirmation.
-
-## Citation
-
-Cite the NASA Airfoil Learning Dataset and the original XFOIL-related source material per
-the NASA project documentation: <https://github.com/nasa/airfoil-learning>.
-
-## License
-
-Intended to use the MIT License; no license file has been added yet. Dataset licensing and
-attribution should be checked independently before redistribution.
+Kernel push starts another run; it is not a status check. Source staging is private
+by default and allowlisted, excluding credentials, personal reports, and raw archives.
+Retain source/data hashes and check that scheduled monitoring remains active after
+an interrupted session; a requested accelerator is not proof of utilization.
+
+## Independent Solver Validation
+
+No new simulation is approved by a low-confidence prediction alone. For this project:
+
+1. The airfoil must be absent from the **entire source dataset**, including the seven
+   unusable cases, aliases, transformed copies, and relevant near-duplicates. Being
+   absent from a training fold is insufficient.
+2. Search for suitable matching online data first and record its coverage/provenance.
+3. Only if the required suitable data are unavailable may an eligible new geometry
+   proceed to a separately planned, bounded physics run.
+
+Known dataset airfoils should use their available references for error diagnosis;
+they are not eligible for new project simulations under this policy. PyFR on cloud
+and OpenFOAM on cloud or, if necessary, a local fallback are future options, not
+automatic ground truth. See [the solver-validation plan](docs/solver-validation.md).
+
+## Next Milestones
+
+- Agree task-specific absolute/relative error budgets and design-screening criteria.
+- Validate a referral rule on geometry-separated calibration/audit data, reporting
+  false accepts, unnecessary referrals, coverage, and performance on new families.
+- Build an explicit reference-data and full-dataset novelty registry before any CFD job.
+- Benchmark batch inference, lookup, geometry setup, and fallback costs on matched tasks.
+- Extend pressure visualization from qualified reference/solver fields first; add
+  surrogate pressure prediction only after separate data-quality and accuracy checks.
+
+## Repository Guide
+
+- `src/data`, `src/geometry`: ingestion, validation, and geometry/flow representation.
+- `src/models`, `src/training`: models, experiments, evaluation, and reliability analysis.
+- `notebooks/v2_experiment_kaggle.ipynb`: cloud experiment entry point.
+- `configs/`: frozen partitions and pinned reference evidence.
+- `docs/validation.md`: current evidence, referral metrics, and calibration plan.
+- `docs/solver-validation.md`: cloud-first, online-data-first independent validation.
+- `docs/archive/`: historical notes, not current project instructions.
+- `data/`, `results/`: preserve inputs, weights, predictions, and provenance; not clutter.
+
+Detailed run narratives are preserved in the [documentation archive](docs/archive/README.md)
+rather than appended to this project guide. The local synopsis and personal reports
+are retained unchanged.

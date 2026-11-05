@@ -201,6 +201,8 @@ def stage_kernel(
     study: bool = False,
     auxiliary_study: bool = False,
     fold_study: bool = False,
+    input_scaling_study: bool = False,
+    selective_scaling_study: bool = False,
 ) -> Path:
     """Write the notebook and its ``kernel-metadata.json`` into a clean folder.
 
@@ -213,7 +215,7 @@ def stage_kernel(
         raise ValueError("accelerator must be 'gpu' or 'cpu'.")
     if machine_shape and accelerator != "gpu":
         raise ValueError("machine_shape requires the GPU accelerator.")
-    if sum((study, auxiliary_study, fold_study)) > 1:
+    if sum((study, auxiliary_study, fold_study, input_scaling_study, selective_scaling_study)) > 1:
         raise ValueError("Choose only one study mode; study flags cannot be combined.")
     notebook, staging_dir = Path(notebook), Path(staging_dir)
     if not notebook.is_file():
@@ -222,7 +224,7 @@ def stage_kernel(
         raise ValueError("Kernel staging directory must be empty; unrelated files must not be uploaded.")
     staging_dir.mkdir(parents=True, exist_ok=True)
     document = json.loads(notebook.read_text(encoding="utf-8"))
-    if auxiliary_study or fold_study:
+    if auxiliary_study or fold_study or input_scaling_study or selective_scaling_study:
         queue = next((cell for cell in document["cells"] if cell.get("id") == "v2-queue"), None)
         if queue is None:
             raise ValueError("Development study mode requires the v2-queue notebook cell.")
@@ -235,7 +237,51 @@ def stage_kernel(
             "print('Paired seeds 42/43/44: unchanged Huber baseline versus auxiliary weight 0.1.')\n",
             "print('Decisions use training-only development tail gates; test is an audit only.')\n",
         ]
-    if study or auxiliary_study or fold_study:
+        if input_scaling_study:
+            queue["source"] = [
+                "print('Input-scaling study: 3 folds x 3 seeds x 2 arms = 18 fits.')\n",
+                "print('Cdp weight 0.1 in both arms; standard versus profile_rms_floor.')\n",
+                "print('Paired ensemble gates, raw clipping diagnostics, and pooled OOF R-squared; ' "
+                "'canonical validation/test are never scored.')\n",
+            ]
+            notes = next((cell for cell in document["cells"] if cell.get("id") == "queue-notes"), None)
+            if notes is not None:
+                notes["source"] = [
+                    "## Paired geometry input-scaling study\n\n",
+                    "Both Cdp arms use identical training-only geometry folds, seeds, loss, "
+                    "and stopping rules. Only sampled-profile scale denominators change. "
+                    "The floor is the RMS of inner-fit profile standard deviations; "
+                    "descriptor/flow scales and production defaults remain unchanged.\n\n",
+                    "Compare ensemble to ensemble. Preserve every evaluation row and raw "
+                    "fitting-space prediction before clipping. A relative gate pass cannot "
+                    "override member clipping or nonpositive per-fold primary R-squared. "
+                    "These are minimum sanity checks, not a production guarantee.\n",
+                ]
+        if selective_scaling_study:
+            queue["source"] = [
+                "print('Selective-scaling study: 3 folds x 3 seeds x 2 arms = 18 fresh fits.')\n",
+                "print('Cdp weight 0.1 in both arms; standard versus profile_rms_floor_1pct.')\n",
+                "print('Fixed 1% RMS scale floor, not 1% accuracy; unchanged paired gates and numerical safety.')\n",
+                "print('Only canonical training geometries are used; validation and test are never scored.')\n",
+            ]
+            notes = next((cell for cell in document["cells"] if cell.get("id") == "queue-notes"), None)
+            if notes is not None:
+                notes["source"] = [
+                    "## Paired selective input-scaling study\n\n",
+                    "18 fresh fits compare standard versus profile_rms_floor_1pct, with Cdp "
+                    "weight 0.1 in both arms. Identical training-only geometry folds, seeds, "
+                    "loss, and stopping rules isolate this one frozen preprocessing change.\n\n",
+                    "For varying sampled thickness/camber coordinates only, the scale floor "
+                    "is fixed at 1% of the RMS of inner-fit profile standard deviations "
+                    "after reflection. This is a 1% RMS scale floor, not 1% accuracy. "
+                    "Descriptor/flow scales and production defaults remain unchanged; "
+                    "there is no ratio tuning or sweep.\n\n",
+                    "Compare ensemble to ensemble using the same relative gates, raw clipping "
+                    "diagnostics, and positive per-fold primary R-squared sanity checks. "
+                    "Keep every evaluation row and raw fitting-space prediction before clipping. "
+                    "Canonical validation/test remain unscored; passing is not a production guarantee.\n",
+                ]
+    if study or auxiliary_study or fold_study or input_scaling_study or selective_scaling_study:
         # Reuse bootstrap/preflight/data loading, but let the study orchestrator
         # freeze all choices before evaluation. Never run the ordinary test cells.
         train_index = next((i for i, cell in enumerate(document["cells"])
@@ -247,7 +293,9 @@ def stage_kernel(
         marker = "validation_results = compare_models("
         if marker not in source:
             raise ValueError("Study mode could not locate the standard training entry point.")
-        module, function = (("fold_study", "run_fold_study") if fold_study else
+        module, function = (("fold_study", "run_selective_scaling_fold_study") if selective_scaling_study else
+                            ("fold_study", "run_input_scaling_fold_study") if input_scaling_study else
+                            ("fold_study", "run_fold_study") if fold_study else
                             ("auxiliary_study", "run_auxiliary_study") if auxiliary_study else
                             ("study", "run_study"))
         source = source.split(marker, 1)[0] + (
@@ -259,7 +307,9 @@ def stage_kernel(
         )
         cell["source"] = source.splitlines(keepends=True)
         document["cells"] = document["cells"][:train_index + 1]
-    mode = "folds" if fold_study else "auxiliary" if auxiliary_study else "controlled" if study else "accuracy"
+    mode = ("selective_scaling" if selective_scaling_study else "input_scaling" if input_scaling_study
+            else "folds" if fold_study
+            else "auxiliary" if auxiliary_study else "controlled" if study else "accuracy")
     document["cells"].insert(0, _source_cell(source_root, accelerator, machine_shape, mode))
     (staging_dir / notebook.name).write_text(
         json.dumps(document, indent=1) + "\n", encoding="utf-8",
@@ -308,6 +358,8 @@ def push_kernel(
     study: bool = False,
     auxiliary_study: bool = False,
     fold_study: bool = False,
+    input_scaling_study: bool = False,
+    selective_scaling_study: bool = False,
 ) -> str:
     """Upload the notebook and queue a run.
 
@@ -319,6 +371,8 @@ def push_kernel(
     processing, then mounts nothing, so the notebook fails on an empty
     ``/kaggle/input`` minutes later with no hint as to why.
     """
+    if sum((study, auxiliary_study, fold_study, input_scaling_study, selective_scaling_study)) > 1:
+        raise ValueError("Choose only one study mode; study flags cannot be combined.")
     status = dataset_status(dataset, runner)
     if "ready" not in status.lower():
         raise RuntimeError(
@@ -332,6 +386,8 @@ def push_kernel(
             kernel, dataset, staging, notebook, private, accelerator=accelerator,
             machine_shape=machine_shape, source_root=source_root,
             study=study, auxiliary_study=auxiliary_study, fold_study=fold_study,
+            input_scaling_study=input_scaling_study,
+            selective_scaling_study=selective_scaling_study,
         )
         return _run(["kaggle", "kernels", "push", "-p", str(staging)], runner)
     finally:
@@ -397,6 +453,11 @@ def main() -> None:
     mode.add_argument("--study", action="store_true", help="Run the controlled seed, loss-sweep, and leakage study.")
     mode.add_argument("--auxiliary-study", action="store_true", help="Run paired Cdp supervision with development-only tail gates.")
     mode.add_argument("--fold-study", action="store_true", help="Run training-only geometry folds and ensemble evaluation.")
+    mode.add_argument("--input-scaling-study", action="store_true", help="Run the paired Cdp geometry-input-scaling study.")
+    mode.add_argument(
+        "--selective-scaling-study", action="store_true",
+        help="Run 18 fresh paired Cdp fits with the fixed 1% RMS scale floor, not 1% accuracy.",
+    )
     kernel.add_argument(
         "--machine-shape", help="Optional Kaggle GPU type, e.g. NvidiaTeslaT4 or NvidiaL4.",
     )
@@ -424,6 +485,8 @@ def main() -> None:
                 args.kernel, args.dataset, args.notebook, private=not args.public,
                 accelerator=args.accelerator, machine_shape=args.machine_shape,
                 study=args.study, auxiliary_study=args.auxiliary_study, fold_study=args.fold_study,
+                input_scaling_study=args.input_scaling_study,
+                selective_scaling_study=args.selective_scaling_study,
             )
             print(output.strip() or f"Pushed {args.notebook.name} to {args.kernel}.")
             print(f"Track it with: python -m src.utils.kaggle_sync status {args.kernel}")

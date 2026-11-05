@@ -181,6 +181,7 @@ def test_frozen_split_refuses_partitions_that_do_not_cover_the_tables(v2_tables)
         comparison.load_frozen_split(geometry_path, polars_path, frozen)
 
 
+@pytest.mark.cloud_fit
 def test_log_drag_is_fitted_in_log_space_but_scored_in_physical_units(tmp_path):
     """The whole point of logging Cd is lost if the metrics stay in log space."""
     x = np.arange(1, 9, dtype=float)[:, None]
@@ -530,6 +531,7 @@ def test_invalid_configs_do_not_create_artifacts(tmp_path, configs, error):
     assert not output.exists()
 
 
+@pytest.mark.cloud_fit
 def test_real_scaled_fit_metrics_and_singleton_r2_are_in_target_units(tmp_path):
     x = np.arange(8, dtype=float)[:, None]
     y = np.column_stack([1000. + 200. * x[:, 0], .001 + .0002 * x[:, 0]])

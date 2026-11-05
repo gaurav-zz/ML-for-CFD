@@ -93,7 +93,7 @@ def test_setup_cell_targets_kaggle_paths_not_drive(cells):
     assert "/kaggle/input" in cells["v2-config"]
 
 
-@pytest.mark.parametrize("study_mode", ["auxiliary", "folds"])
+@pytest.mark.parametrize("study_mode", ["auxiliary", "folds", "input_scaling", "selective_scaling"])
 def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, kaggle_inputs, monkeypatch, study_mode):
     from src.data import auxiliary
     from src.training import comparison
@@ -146,6 +146,8 @@ def test_auxiliary_data_cell_preserves_rows_and_defers_holdout_matrices(cells, k
 @pytest.mark.parametrize("study_mode,module_name,entry_name", [
     ("auxiliary", "auxiliary_study", "run_auxiliary_study"),
     ("folds", "fold_study", "run_fold_study"),
+    ("input_scaling", "fold_study", "run_input_scaling_fold_study"),
+    ("selective_scaling", "fold_study", "run_selective_scaling_fold_study"),
 ])
 def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(
     kaggle_inputs, tmp_path, monkeypatch, study_mode, module_name, entry_name,
@@ -154,6 +156,7 @@ def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(
     from importlib import metadata as package_metadata
 
     from src.data import auxiliary
+    from src.training import comparison
     from src.utils.kaggle_sync import stage_kernel
 
     study_module = import_module(f"src.training.{module_name}")
@@ -176,36 +179,74 @@ def test_staged_auxiliary_notebook_reaches_study_entry_without_fitting(
 
     monkeypatch.setattr(auxiliary, "load_auxiliary", load_labels)
     monkeypatch.setattr(study_module, entry_name, record_study)
+    original_loader = comparison.load_frozen_split
+
+    class Protected(pd.DataFrame):
+        def __getitem__(self, key):
+            if isinstance(key, list) and any(name not in keys for name in key):
+                pytest.fail("Study setup must not materialize held-out feature/target matrices")
+            return super().__getitem__(key)
+
+    def loader(*args, **kwargs):
+        split, features, targets, metadata = original_loader(*args, **kwargs)
+        split.validation, split.test = Protected(split.validation), Protected(split.test)
+        return split, features, targets, metadata
+
+    monkeypatch.setattr(comparison, "load_frozen_split", loader)
     installed_version = package_metadata.version
     # Version logging must not require the cloud-only training/plot dependencies
     # in the minimal fit-free CI environment.
     monkeypatch.setattr(package_metadata, "version",
                         lambda name: "mock" if name in {"torch", "matplotlib"} else installed_version(name))
-    staged = stage_kernel("me/study", "me/data", tmp_path / "stage", **{module_name: True})
+    stage_option = f"{study_mode}_study" if study_mode in {"input_scaling", "selective_scaling"} else module_name
+    staged = stage_kernel("me/study", "me/data", tmp_path / "stage", **{stage_option: True})
     document = nbformat.read(staged / NOTEBOOK.name, as_version=4)
     sources = {cell.id: cell.source for cell in document.cells if cell.cell_type == "code"}
-    # These are the real bootstrap's outputs, not guessed dataset globals.
+    (root / "src").mkdir()
+    bootstrap_calls = []
+    monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: bootstrap_calls.append((command, kwargs)))
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: pytest.fail("Bundled setup must not query Git"))
+    is_dir = Path.is_dir
+    monkeypatch.setattr(Path, "is_dir", lambda path: True if str(path) in {
+        "/kaggle/input", "/kaggle/working",
+    } else is_dir(path))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    fake_torch = SimpleNamespace(
+        __version__="mock", version=SimpleNamespace(cuda="mock"),
+        cuda=SimpleNamespace(is_available=lambda: True, current_device=lambda: 0,
+                             get_device_name=lambda index: "mock GPU", device_count=lambda: 1),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    # Execute the real sequential bootstrap with external install/preflight and
+    # Torch mocked, then resolve tables and reach the mocked study entrypoint.
     namespace = {
-        "Path": Path, "sys": sys, "PROJECT_ROOT": root,
-        "SOURCE_REVISION": "a" * 40, "SOURCE_SHA256": "b" * 64, "SOURCE_MODE": "bundle",
-        "ACCELERATOR": "gpu", "GPU_TESTS_PASSED": True, "CPU_TESTS_PASSED": False,
-        "GPU_METADATA": {"device_name": "mock GPU"},
-        "torch": SimpleNamespace(__version__="mock", cuda=SimpleNamespace(is_available=lambda: True)),
+        "BUNDLED_SOURCE_DIR": root, "BUNDLED_GIT_REVISION": "a" * 40,
+        "BUNDLED_SOURCE_SHA256": "b" * 64,
     }
     for statement in ast.parse(sources["kaggle-source-bundle"]).body:
         if isinstance(statement, ast.Assign) and statement.targets[0].id.startswith("KAGGLE_"):
             namespace[statement.targets[0].id] = ast.literal_eval(statement.value)
+    for name in ("kaggle-setup", "kaggle-gpu-tests"):
+        exec(compile(sources[name], f"kaggle:{name}", "exec"), namespace)
     exec(compile(sources["v2-config"], "kaggle:config", "exec"), namespace)
     namespace.update(INPUT_ROOT=data_dir.parent, OUTPUT_ROOT=tmp_path / "working")
     for name in ("v2-resolve", "v2-data", "v2-queue", "v2-train"):
         exec(compile(sources[name], f"kaggle:{name}", "exec"), namespace)
     assert "DATA_DIR" not in namespace
+    assert not {"X_train", "X_validation", "y_train", "y_validation", "X_test", "y_test"}.intersection(namespace)
+    assert len(bootstrap_calls) == 2
+    assert bootstrap_calls[0][0][:5] == [sys.executable, "-m", "pip", "install", "-q"]
+    assert bootstrap_calls[1][0][:4] == [sys.executable, "-m", "pytest", "-q"]
     assert len(seen) == 1
     split, features, targets, output, options = seen[0]
     assert targets == ["Cl", "Cd", "Cm"] and len(features) == 113
-    assert "Cdp" not in features and split.train.Cdp_observed.all()
+    assert not {"Cdp", "Cdp_observed"}.intersection(features) and split.train.Cdp_observed.all()
+    assert set(options) == {"run_metadata", "device"}
     assert options["device"] == "cuda"
     assert options["run_metadata"]["study_mode"] == study_mode
+    assert options["run_metadata"]["source_sha256"] == "b" * 64
+    assert options["run_metadata"]["gpu_tests_passed"] is True
+    assert options["run_metadata"]["gpu"]["device_name"] == "mock GPU"
     assert options["run_metadata"]["auxiliary"]["sidecar_sha256"] == "d" * 64
     assert not output.exists(), "The study entrypoint is mocked; no fit/artifact work may occur"
 
@@ -446,6 +487,8 @@ def test_discovery_refuses_an_ambiguous_mount(cells, kaggle_inputs, tmp_path):
         exec(compile(cells["v2-resolve"], "kaggle:v2-resolve", "exec"), namespace)
 
 
+@pytest.mark.gpu
+@pytest.mark.cloud_fit
 @pytest.mark.skipif(
     os.environ.get("KAGGLE_GPU_TESTS") != "1" or not Path("/kaggle/working").is_dir(),
     reason="Notebook fitting tests run only on Kaggle via API with KAGGLE_GPU_TESTS=1",

@@ -81,6 +81,8 @@ def test_factory_defaults_clone_and_no_fitted_state():
     assert model.huber_delta == 0.05
     assert model.target_weights == (1, 2, 0.5)
     assert model.auxiliary_weight == 0.0
+    assert model.input_scaling == "standard"
+    assert clone(build_model(input_scaling="profile_rms_floor")).input_scaling == "profile_rms_floor"
     assert clone(build_model(auxiliary_weight=0.25)).auxiliary_weight == 0.25
     assert model.symmetry is True
     assert model.target_names == ("Cl", "Cd", "Cm")
@@ -106,6 +108,133 @@ def test_internal_features_and_geometry_reflection():
     assert signs[-2] == -1 and signs[-1] == 1
     pd.testing.assert_frame_equal(frame, original)
     assert EXTRA_FEATURE_NAMES == ("alpha_sin2", "alpha_sin_sq")
+
+
+@pytest.mark.parametrize("mode", ["standard", "profile_rms_floor", "profile_rms_floor_1pct"])
+@pytest.mark.parametrize("reverse_columns", [False, True])
+def test_profile_scale_floor_uses_only_profile_training_variance(mode, reverse_columns):
+    frame = _frame()
+    frame["camber_049"] = np.linspace(-1e-7, 1e-7, len(frame))
+    frame["thickness_000"] = 0.0
+    if reverse_columns:
+        frame = frame[frame.columns[::-1]]
+    model = _portable_model(frame)
+    model.input_scaling = mode
+    scaler = model.input_scaler_
+    before = {name: getattr(scaler, name).copy() for name in ("mean_", "var_", "scale_")}
+    names = [*frame.columns, *EXTRA_FEATURE_NAMES]
+    profile = np.array([name.startswith(("thickness_", "camber_"))
+                        and name.rsplit("_", 1)[-1].isdigit() for name in names])
+    expected = before["scale_"].copy()
+    rms = float(np.sqrt(before["var_"][profile].mean()))
+    floor = .01 * rms if mode == "profile_rms_floor_1pct" else rms
+    if mode != "standard":
+        expected[profile] = np.maximum(expected[profile], floor)
+    details = model._apply_input_scaling()
+    np.testing.assert_array_equal(scaler.scale_, expected)
+    for name in ("mean_", "var_"):
+        np.testing.assert_array_equal(getattr(scaler, name), before[name])
+    np.testing.assert_array_equal(scaler.scale_[~profile], before["scale_"][~profile])
+    assert scaler.n_samples_seen_ == len(frame)
+    assert scaler.scale_[names.index("thickness_000")] == 1.0
+    assert details["profile_rms_floor"] == (floor if mode != "standard" else None)
+    assert len(details["profile_columns"]) == 100
+    assert details["effective_scales"] == expected.tolist()
+    assert details["standard_scales"] == before["scale_"].tolist()
+    assert details["feature_order"] == names
+    json.dumps(details, allow_nan=False)
+    if mode != "standard":
+        assert "camber_049" in details["adjusted_features"]
+        assert abs(-.000688 / scaler.scale_[names.index("camber_049")]) < 1
+    else:
+        assert details["adjusted_features"] == []
+    if mode == "profile_rms_floor_1pct":
+        assert details["profile_rms"] == rms
+        assert details["profile_floor_ratio"] == .01
+        assert details["rms_relative_gain_limit"] == 100
+        assert np.all(rms / scaler.scale_[profile & (scaler.var_ > 0)] <= 100 + 1e-12)
+    else:
+        assert "profile_floor_ratio" not in details
+
+
+@pytest.mark.parametrize("mode", ["profile_rms_floor", "profile_rms_floor_1pct"])
+def test_zero_variance_profile_floor_preserves_safe_denominators(mode):
+    frame = _frame()
+    frame.loc[:, [name for name in frame if name.startswith(("thickness_", "camber_"))
+                  and name.rsplit("_", 1)[-1].isdigit()]] = 0.
+    model = _portable_model(frame)
+    model.input_scaling = mode
+    before = model.input_scaler_.scale_.copy()
+    details = model._apply_input_scaling()
+    assert details["profile_rms_floor"] == 0.
+    assert details["adjusted_features"] == []
+    np.testing.assert_array_equal(model.input_scaler_.scale_, before)
+
+
+@pytest.mark.parametrize("mode", ["profile_rms_floor", "profile_rms_floor_1pct"])
+def test_constant_profile_scale_stays_one_even_when_floor_exceeds_one(mode):
+    frame = _frame()
+    names = [name for name in frame if name.startswith(("thickness_", "camber_"))
+             and name.rsplit("_", 1)[-1].isdigit()]
+    frame.loc[:, names] *= 1000
+    frame["thickness_000"] = 0.
+    model = _portable_model(frame)
+    model.input_scaling = mode
+    details = model._apply_input_scaling()
+    assert details["profile_rms_floor"] > 1
+    assert model.input_scaler_.scale_[list(frame.columns).index("thickness_000")] == 1
+    assert "thickness_000" not in details["adjusted_features"]
+
+
+def test_selective_floor_preserves_resolved_profile_scales_and_roundtrips(tmp_path, monkeypatch):
+    frame = _frame()
+    for name in ("camber_000", "camber_048", "camber_049"):
+        frame[name] *= 1e-4
+    frame["camber_020"] *= .03
+    model = _portable_model(frame)
+    model.input_scaling = "profile_rms_floor_1pct"
+    original = model.input_scaler_.scale_.copy()
+    details = model._apply_input_scaling()
+    assert set(details["adjusted_features"]) == {"camber_000", "camber_048", "camber_049"}
+    interior = list(frame.columns).index("camber_020")
+    assert details["profile_rms_floor"] < original[interior] < details["profile_rms"]
+    assert model.input_scaler_.scale_[interior] == original[interior]
+    assert clone(model).input_scaling == "profile_rms_floor_1pct"
+    expected = model.predict(frame)
+    path = tmp_path / "selective_floor.joblib"
+    joblib.dump(model, path)
+    original_import = builtins.__import__
+
+    def no_torch(name, *args, **kwargs):
+        assert name.split(".")[0] != "torch"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_torch)
+    loaded = joblib.load(path)
+    assert loaded.input_scaling == "profile_rms_floor_1pct"
+    np.testing.assert_array_equal(loaded.input_scaler_.scale_, model.input_scaler_.scale_)
+    np.testing.assert_array_equal(loaded.predict(frame), expected)
+
+
+def test_legacy_saved_model_keeps_scales_and_defaults_without_torch(tmp_path, monkeypatch):
+    frame = _frame()
+    model = _portable_model(frame)
+    expected = model.predict(frame)
+    scales = model.input_scaler_.scale_.copy()
+    del model.input_scaling
+    path = tmp_path / "pre_scaling_option.joblib"
+    joblib.dump(model, path)
+    original_import = builtins.__import__
+
+    def no_torch(name, *args, **kwargs):
+        assert name.split(".")[0] != "torch"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_torch)
+    loaded = joblib.load(path)
+    assert loaded.input_scaling == loaded.get_params()["input_scaling"] == "standard"
+    np.testing.assert_array_equal(loaded.input_scaler_.scale_, scales)
+    np.testing.assert_array_equal(loaded.predict(frame), expected)
 
 
 @pytest.mark.parametrize("target_names", [("Cl", "Cd", "Cm"), ("Cm", "Cl", "Cd")])
@@ -198,6 +327,8 @@ def test_explicit_validation_guard_precedes_torch_import(validation, monkeypatch
     {"hidden_layers": ()}, {"hidden_layers": (1.5,)}, {"learning_rate_init": 0},
     {"weight_decay": -1}, {"huber_delta": 0}, {"min_delta": np.nan}, {"lr_factor": 1},
     {"loss": "mae"}, {"device": "cuda:0"}, {"symmetry": 1},
+    {"input_scaling": "unknown"}, {"input_scaling": True}, {"input_scaling": None},
+    {"input_scaling": ["standard"]},
     {"target_names": ("Cl", "logCd", "Cm")}, {"target_names": ("Cl", "Cl", "Cm")},
     {"target_names": ["Cl", "Cd", "Cm"]}, {"target_weights": (1, 2)},
     {"target_weights": (1, 0, 1)}, {"random_state": -1},
@@ -369,16 +500,18 @@ KAGGLE_GPU_ONLY = pytest.mark.skipif(
 )
 @pytest.mark.parametrize("loss", ["mse", "huber"])
 @pytest.mark.parametrize("auxiliary_weight", [0.0, 0.25])
-def test_kaggle_cpu_fitting_and_portable_predictions(loss, auxiliary_weight, tmp_path):
+@pytest.mark.parametrize("input_scaling", ["standard", "profile_rms_floor", "profile_rms_floor_1pct"])
+def test_kaggle_cpu_fitting_and_portable_predictions(loss, auxiliary_weight, input_scaling, tmp_path):
     pytest.importorskip("torch")
     train, targets, val, val_targets = _gpu_data()
     model = build_model(hidden_layers=(8,), max_iter=3, batch_size=32, patience=10,
-                        device="cpu", loss=loss, auxiliary_weight=auxiliary_weight)
+                        device="cpu", loss=loss, auxiliary_weight=auxiliary_weight, input_scaling=input_scaling)
     auxiliary = np.linspace(-0.2, 0.4, len(train), dtype=np.float32)
     auxiliary[::3] = np.nan
     options = {"auxiliary_targets": auxiliary, "validation_auxiliary_targets": np.full(len(val), np.nan)} if auxiliary_weight else {}
     model.fit(train, targets, validation_data=(val, val_targets), **options)
     assert model.training_metadata_["accelerator"] == "cpu"
+    assert model.training_metadata_["input_scaling"] == input_scaling
     assert model.training_metadata_["restored_best_checkpoint"] is True
     assert model.n_iter_ == 3
     json.dumps(model.training_metadata_, allow_nan=False)
@@ -426,6 +559,53 @@ def _gpu_data():
         -0.3 + 0.01 * val["Alpha"],
     )).astype(np.float32)
     return train, train_targets, val, val_targets
+
+
+@pytest.mark.gpu
+@KAGGLE_GPU_ONLY
+@pytest.mark.parametrize("symmetry", [False, True])
+@pytest.mark.parametrize("auxiliary_weight", [0.0, 0.1])
+@pytest.mark.parametrize("input_scaling", ["profile_rms_floor", "profile_rms_floor_1pct"])
+def test_kaggle_profile_floor_uses_fit_only_and_matches_numpy(symmetry, auxiliary_weight, input_scaling, kaggle_cuda, tmp_path):
+    train, targets, val, val_targets = _gpu_data()
+    train["camber_049"] = np.linspace(-1e-7, 1e-7, len(train))
+    val["camber_049"] = .5
+    model = build_model(hidden_layers=(8,), max_iter=3, batch_size=32, patience=10,
+                        device="cuda", symmetry=symmetry, auxiliary_weight=auxiliary_weight,
+                        input_scaling=input_scaling)
+    options = {"auxiliary_targets": np.linspace(-.1, .2, len(train))} if auxiliary_weight else {}
+    model.fit(train, targets, validation_data=(val, val_targets), **options)
+    raw = model._feature_array(train)
+    fitting = np.concatenate((raw, raw * model.reflection_signs_)) if symmetry else raw
+    expected = StandardScaler().fit(fitting)
+    profile = np.arange(100)
+    floor = np.sqrt(expected.var_[profile].mean())
+    if input_scaling == "profile_rms_floor_1pct":
+        floor *= .01
+    expected.scale_[profile] = np.maximum(expected.scale_[profile], floor)
+    np.testing.assert_allclose(model.input_scaler_.mean_, expected.mean_, atol=1e-7)
+    np.testing.assert_allclose(model.input_scaler_.var_, expected.var_, atol=1e-7)
+    np.testing.assert_allclose(model.input_scaler_.scale_, expected.scale_, atol=1e-7)
+    assert model.input_scaler_.n_samples_seen_ == len(fitting)
+    metadata = model.training_metadata_
+    assert metadata["input_scaling"] == input_scaling
+    assert metadata["input_scaling_details"]["profile_rms_floor"] == pytest.approx(floor)
+    assert "camber_049" in metadata["input_scaling_details"]["adjusted_features"]
+    assert metadata["restored_best_checkpoint"]
+    json.dumps(metadata, allow_nan=False)
+    prediction = model.predict(val)
+    error = np.abs((prediction - val_targets) / model.target_scaler_.scale_)
+    elements = np.where(error <= model.huber_delta, .5 * error ** 2,
+                        model.huber_delta * (error - .5 * model.huber_delta))
+    measured = np.average(elements, weights=model.target_weights, axis=1).mean()
+    np.testing.assert_allclose(measured, model.best_loss_, rtol=2e-5, atol=2e-6)
+    if symmetry:
+        np.testing.assert_allclose(model.predict(_reflect(val)), prediction * model.target_signs_, atol=1e-6)
+    path = tmp_path / "profile_floor.joblib"
+    joblib.dump(model, path)
+    loaded = joblib.load(path)
+    assert loaded.input_scaling == input_scaling
+    np.testing.assert_array_equal(loaded.predict(val), prediction)
 
 
 @pytest.mark.gpu

@@ -38,6 +38,8 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
     array targets must follow that order and DataFrames must match it exactly.
     Optional Cdp supervision is identity-scaled, missing-label aware, and never
     changes the primary loss denominator or validation stopping criterion.
+    The opt-in profile scale floor changes only sampled geometry denominators;
+    the default retains per-column standard scaling and historical inference.
     """
 
     def __init__(
@@ -59,6 +61,7 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
         random_state=42,
         device="auto",
         auxiliary_weight=0.0,
+        input_scaling="standard",
     ):
         self.hidden_layers = hidden_layers
         self.max_iter = max_iter
@@ -77,6 +80,14 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
         self.random_state = random_state
         self.device = device
         self.auxiliary_weight = auxiliary_weight
+        self.input_scaling = input_scaling
+
+    def __setstate__(self, state):
+        # Previously saved Kaggle models lack this option. Their fitted scales
+        # remain authoritative; loading must never recompute or floor them.
+        state = state.copy()
+        state.setdefault("input_scaling", "standard")
+        super().__setstate__(state)
 
     def _validate_params(self):
         for name in ("max_iter", "batch_size", "patience", "lr_patience"):
@@ -103,6 +114,10 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             raise ValueError("loss must be 'mse' or 'huber'.")
         if self.device not in ("auto", "cuda", "cpu"):
             raise ValueError("device must be 'auto', 'cuda', or 'cpu'.")
+        if not isinstance(self.input_scaling, str) or self.input_scaling not in (
+            "standard", "profile_rms_floor", "profile_rms_floor_1pct",
+        ):
+            raise ValueError("input_scaling must be 'standard', 'profile_rms_floor', or 'profile_rms_floor_1pct'.")
         if not isinstance(self.symmetry, (bool, np.bool_)):
             raise ValueError("symmetry must be boolean.")
         if (not isinstance(self.target_names, tuple) or not self.target_names
@@ -172,6 +187,39 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             -1.0 if name in odd or (name.startswith("camber_") and name[7:].isdigit()) else 1.0
             for name in (*names, *EXTRA_FEATURE_NAMES)
         ], dtype=np.float32)
+
+    def _apply_input_scaling(self):
+        """Use already-fitted training moments, never validation coordinates.
+
+        All 100 profile coordinates share chord units. Their pooled variance
+        supplies a scale floor without tuning a threshold to held-out cases.
+        Constant features keep StandardScaler's safe denominator of one.
+        The selective mode fixes the floor at one percent of that RMS, limiting
+        RMS-relative amplification rather than claiming a matrix condition bound.
+        """
+        names = (*self.feature_names_in_, *EXTRA_FEATURE_NAMES)
+        profile = np.array([name.startswith(("thickness_", "camber_"))
+                            and name.rsplit("_", 1)[-1].isdigit() for name in names])
+        original = self.input_scaler_.scale_.copy()
+        floor = rms = None
+        if self.input_scaling in ("profile_rms_floor", "profile_rms_floor_1pct"):
+            rms = float(np.sqrt(np.mean(self.input_scaler_.var_[profile])))
+            floor = .01 * rms if self.input_scaling == "profile_rms_floor_1pct" else rms
+            varying_profile = profile & (self.input_scaler_.var_ > 0)
+            self.input_scaler_.scale_[varying_profile] = np.maximum(original[varying_profile], floor)
+        return {
+            "mode": self.input_scaling,
+            "statistics_source": "training_only_with_reflection" if self.symmetry_ else "training_only",
+            "profile_rms_floor": floor,
+            "profile_columns": [name for name, selected in zip(names, profile) if selected],
+            "adjusted_features": [name for name, before, after in zip(names, original, self.input_scaler_.scale_)
+                                  if after != before],
+            "feature_order": list(names),
+            "standard_scales": original.tolist(),
+            "effective_scales": self.input_scaler_.scale_.tolist(),
+            **({"profile_rms": rms, "profile_floor_ratio": .01, "rms_relative_gain_limit": 100}
+               if self.input_scaling == "profile_rms_floor_1pct" else {}),
+        }
 
     @staticmethod
     def _auxiliary_array(values, n_rows):
@@ -253,6 +301,7 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             # Train-only reflection, in bounded CPU chunks; no validation statistics.
             for start in range(0, len(x_train), self.batch_size):
                 self.input_scaler_.partial_fit(x_train[start:start + self.batch_size] * self.reflection_signs_)
+        input_scaling_details = self._apply_input_scaling()
         self.target_scaler_ = StandardScaler().fit(y_train)
         self.__dict__.pop("auxiliary_scaler_", None)
         if auxiliary_enabled:
@@ -454,6 +503,7 @@ class TorchMLPRegressor(RegressorMixin, BaseEstimator):
             "batch_size": int(self.batch_size), "hidden_layers": [int(n) for n in self.hidden_layers],
             "n_train": len(x_train), "n_validation": len(x_val),
             "n_raw_features": self.n_features_in_, "n_network_features": x_train.shape[1],
+            "input_scaling": self.input_scaling, "input_scaling_details": input_scaling_details,
             "history": history, "history_truncated": epoch > len(history),
         }
         if auxiliary_enabled:

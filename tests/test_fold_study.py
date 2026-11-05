@@ -2,6 +2,7 @@
 
 import builtins
 from copy import deepcopy
+import inspect
 import json
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from src.data.preprocessing import SplitData
 from src.models import ensemble
 from src.models.torch_mlp import RAW_FEATURE_NAMES, TorchMLPRegressor
 from src.training import comparison, fold_gate, fold_study, study
-from src.training.targets import DEFAULT_TARGET_TRANSFORMS, forward_targets
+from src.training.targets import DEFAULT_TARGET_TRANSFORMS, INVERSE_LIMITS, forward_targets, inverse_targets
+from src.utils.metrics import regression_metrics
 
 
 FEATURES = list(RAW_FEATURE_NAMES)
@@ -48,10 +50,13 @@ class MockPredictor:
             assert len(EVENTS["calls"]) == (self.fold_id + 1) * 6
             assert list(x.index) == list(EVENTS["split"].train.iloc[EVENTS["positions"][self.fold_id]["evaluation"]].index)
             assert not (EVENTS["output"] / "fold_selection.json").exists()
-            EVENTS["predictions"].append((self.fold_id, self.parameters["random_state"], self.parameters["auxiliary_weight"], list(x.index)))
+            arm_id = self.parameters["input_scaling"] if EVENTS.get("input_scaling_study") else self.parameters["auxiliary_weight"]
+            EVENTS["predictions"].append((self.fold_id, self.parameters["random_state"], arm_id, list(x.index)))
         actual = physical_targets(x)
         seed_index = self.parameters["random_state"] - 42
         arm = "cdp" if self.parameters["auxiliary_weight"] else "baseline"
+        if EVENTS.get("input_scaling_study"):
+            arm = "cdp_column_scaling" if self.parameters["input_scaling"] == "standard" else "cdp_profile_scaling"
         factors = EVENTS["factors"][arm]
         physical = actual * (1 + factors[seed_index])
         physical[:, 1] = np.log(physical[:, 1])
@@ -59,6 +64,14 @@ class MockPredictor:
             return physical[:, :2]
         if evaluation and EVENTS["bad_prediction"] == "nonfinite":
             physical[0, 0] = np.nan
+        if evaluation and EVENTS["bad_prediction"] == "nonfinite_log":
+            physical[0, 1] = np.inf
+        if evaluation and EVENTS["bad_prediction"] == "complex":
+            return physical.astype(complex) + 1j
+        if evaluation and EVENTS["bad_prediction"] == "strings":
+            return physical.astype(str)
+        if evaluation and EVENTS.get("clip") == (self.fold_id, self.parameters["random_state"], arm):
+            physical[0, 1] = np.log(INVERSE_LIMITS[1]) + 1.
         return physical
 
 
@@ -142,10 +155,10 @@ def mocked_training(monkeypatch, frozen):
         x_stop, y_stop = parameters.pop("validation_data")
         assert parameters.pop("target_names") == tuple(TARGETS)
         assert list(x.columns) == list(x_stop.columns) == FEATURES
-        np.testing.assert_allclose(y, forward_targets(physical_targets(x), TARGETS, DEFAULT_TARGET_TRANSFORMS))
-        np.testing.assert_allclose(y_stop, forward_targets(physical_targets(x_stop), TARGETS, DEFAULT_TARGET_TRANSFORMS))
         expected_fit = split.train.iloc[state["positions"][fold_id]["fit"]]
         expected_stop = split.train.iloc[state["positions"][fold_id]["stopping"]]
+        np.testing.assert_allclose(y, forward_targets(expected_fit[TARGETS], TARGETS, DEFAULT_TARGET_TRANSFORMS))
+        np.testing.assert_allclose(y_stop, forward_targets(expected_stop[TARGETS], TARGETS, DEFAULT_TARGET_TRANSFORMS))
         assert list(x.index) == list(expected_fit.index)
         assert list(x_stop.index) == list(expected_stop.index)
         if parameters["auxiliary_weight"]:
@@ -607,4 +620,465 @@ def test_kaggle_guard_precedes_split_access_and_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(study, "_KAGGLE_WORKING", tmp_path / "absent")
     with pytest.raises(RuntimeError, match="only on Kaggle"):
         fold_study.run_fold_study(None, FEATURES, TARGETS, tmp_path / "no-output")
+    assert not (tmp_path / "no-output").exists()
+
+
+@pytest.fixture(params=("profile_rms_floor", "profile_rms_floor_1pct"))
+def mocked_input_scaling(mocked_training, monkeypatch, request):
+    state = mocked_training
+    state.update(input_scaling_study=True, candidate_mode=request.param,
+                 factors={"cdp_column_scaling": [.005, .006, .007], "cdp_profile_scaling": [.001, .002, .003]})
+    gate_name = "paired_selective_scaling_fold_gate" if request.param == "profile_rms_floor_1pct" else "paired_input_scaling_fold_gate"
+    original_gate = getattr(fold_gate, gate_name)
+
+    def gate(reference, candidate, expected_geometry_ids):
+        assert len(state["calls"]) == len(state["predictions"]) == 18
+        assert len(state["reports"]) == 24 and len(state["aggregates"]) == 6
+        assert not (state["output"] / "fold_selection.json").exists()
+        assert set(reference) == set(candidate) == {0, 1, 2}
+        state["gate_calls"].append((deepcopy(reference), deepcopy(candidate)))
+        return original_gate(reference, candidate, expected_geometry_ids)
+
+    monkeypatch.setattr(fold_gate, gate_name, gate)
+    return state
+
+
+def run_scaling_mock(cloud, frozen, state, name="input-scaling"):
+    state["output"] = cloud / name
+    wrapper = fold_study.run_selective_scaling_fold_study if state["candidate_mode"] == "profile_rms_floor_1pct" else fold_study.run_input_scaling_fold_study
+    return wrapper(frozen[0], FEATURES, TARGETS, state["output"], frozen[1], device="cpu")
+
+
+def test_input_scaling_frozen_18_configs_both_cdp_and_complete_replay(cloud, frozen, mocked_input_scaling):
+    before = deepcopy(frozen[1])
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    output = mocked_input_scaling["output"]
+    selective = mocked_input_scaling["candidate_mode"] == "profile_rms_floor_1pct"
+    arms = ("cdp_column_scaling", "cdp_profile_scaling")
+    modes = dict(zip(arms, ("standard", mocked_input_scaling["candidate_mode"])))
+    expected = [f"fold_{fold}_seed_{seed}_{arm}" for fold in range(3) for seed in (42, 43, 44) for arm in arms]
+    assert result["plan"]["trial_order"] == [call["trial_id"] for call in mocked_input_scaling["calls"]] == expected
+    assert result["completed_fits"] == result["completed_member_evaluations"] == 18
+    assert result["completed_ensemble_evaluations"] == 6
+    assert result["study_kind"] == "paired_geometry_input_scaling" and result["production_promotion"] is False
+    assert result["plan"]["reference"] == "cdp_column_scaling_ensemble"
+    assert result["plan"]["candidate_order"] == ["cdp_profile_scaling_ensemble"] and result["plan"]["fallback"] is None
+    assert result["selection"]["selected_family"] == "cdp_profile_scaling_ensemble"
+    assert result["selection"]["new_recommendation"] and result["selection"]["production_promotion"] is False
+    assert result["selection"]["reference"] == "cdp_column_scaling_ensemble"
+    assert result["run_metadata"] == before == frozen[1]
+    assert result["plan"]["input_scaling_modes"] == modes
+    assert len(mocked_input_scaling["gate_calls"]) == 1
+    assert len(result["selection"]["gates"]["cdp_profile_scaling_ensemble"]["checks"]) == 17
+    assert all(len(item["checks"]) == 12 for item in result["selection"]["numerical_safety"].values())
+    for record in (result, result["plan"], result["plan"]["fold_plan"], result["selection"]):
+        if selective:
+            assert record["study_variant"] == "selective_profile_floor_1pct"
+        else:
+            assert "study_variant" not in record
+    if selective:
+        assert result["selection"]["input_scaling_modes"] == modes
+    _, frozen_plan, _ = fold_study._geometry_folds(frozen[0].train)
+    for fold in range(3):
+        actual_plan = result["plan"]["fold_plan"]["folds"][str(fold)]
+        assert actual_plan["partitions"] == frozen_plan["folds"][fold]["partitions"]
+        assert actual_plan["stopping_seed"] == frozen_plan["folds"][fold]["stopping_seed"]
+    for fold in range(3):
+        for seed in (42, 43, 44):
+            column = deepcopy(result["trials"][f"fold_{fold}_seed_{seed}_{arms[0]}"]["config"])
+            profile = deepcopy(result["trials"][f"fold_{fold}_seed_{seed}_{arms[1]}"]["config"])
+            assert column["parameters"].pop("input_scaling") == "standard"
+            assert profile["parameters"].pop("input_scaling") == mocked_input_scaling["candidate_mode"]
+            assert column == profile and column["parameters"]["auxiliary_weight"] == .1
+            assert column["parameters"]["huber_delta"] == .05
+            expected_parameters = TorchMLPRegressor().get_params(deep=False)
+            for name in ("target_names", "input_scaling"):
+                expected_parameters.pop(name)
+            expected_parameters.update(device="cpu", auxiliary_weight=.1, random_state=seed)
+            assert column["parameters"] == json.loads(json.dumps(expected_parameters))
+            for arm in arms:
+                trial = result["trials"][f"fold_{fold}_seed_{seed}_{arm}"]
+                saved = read_json(output / trial["manifest"])
+                metadata = saved["run_metadata"]
+                assert metadata["input_scaling"] == modes[arm]
+                if selective:
+                    assert metadata["study_variant"] == "selective_profile_floor_1pct"
+                    tail = read_json(output / trial["tail_report"])
+                    assert tail["study_variant"] == metadata["study_variant"]
+                    assert tail["input_scaling"] == modes[arm]
+    assert len(set((fold, seed, mode) for fold, seed, mode, _ in mocked_input_scaling["predictions"])) == 18
+    for path in result["artifacts"].values():
+        assert (output / path).is_file()
+    for path in ("member_metrics.csv", "ensemble_metrics.csv", "summary.csv"):
+        rows = pd.read_csv(output / path)
+        assert set(rows.study_kind) == {"paired_geometry_input_scaling"}
+        assert set(rows.input_scaling) == set(modes.values())
+        if selective:
+            assert set(rows.study_variant) == {"selective_profile_floor_1pct"}
+    assert result == read_json(output / "fold_study.json")
+    assert result["prediction_artifacts"] == read_json(output / "prediction_artifacts.json")
+    for fold in range(3):
+        for arm in arms:
+            artifact = result["prediction_artifacts"][str(fold)][arm]
+            assert artifact["status"] == "complete" and artifact["n_members"] == 3 and artifact["ensemble_present"]
+            with np.load(output / artifact["path"], allow_pickle=False) as arrays:
+                identity_keys = {"input_scaling", "study_variant"} if selective else set()
+                assert set(arrays.files) == {"canonical_train_positions", "member_seeds", "fitting_predictions",
+                                             "physical_predictions", "physical_ensemble_predictions", "lower_clipped",
+                                             "upper_clipped", "raw_log_Cd_std", "clipped_log_Cd_std"} | identity_keys
+                if selective:
+                    assert arrays["input_scaling"].item() == artifact["input_scaling"] == modes[arm]
+                    assert arrays["study_variant"].item() == artifact["study_variant"] == "selective_profile_floor_1pct"
+                np.testing.assert_array_equal(arrays["canonical_train_positions"], mocked_input_scaling["positions"][fold]["evaluation"])
+                np.testing.assert_array_equal(arrays["member_seeds"], [42, 43, 44])
+                raw, physical = arrays["fitting_predictions"], arrays["physical_predictions"]
+                assert raw.shape == physical.shape == (3, artifact["n_rows"], 3)
+                np.testing.assert_allclose(physical, np.stack([inverse_targets(member, TARGETS, DEFAULT_TARGET_TRANSFORMS) for member in raw]))
+                rebuilt = ensemble.aggregate_predictions(physical)
+                np.testing.assert_allclose(arrays["physical_ensemble_predictions"], rebuilt["prediction"])
+                assert not arrays["lower_clipped"].any() and not arrays["upper_clipped"].any()
+                np.testing.assert_allclose(arrays["raw_log_Cd_std"], raw[:, :, 1].std(axis=0, ddof=1))
+            report = read_json(output / result["numerical_reports"][str(fold)][arm])
+            assert report["status"] == "complete" and report["safe_no_clipping"]
+            assert report["input_scaling"] == modes[arm]
+            tail = read_json(output / result["ensemble_reports"][str(fold)][arm])
+            assert tail["predictor"] == f"{arm}_ensemble" and tail["member_seeds"] == [42, 43, 44]
+            assert tail["study_kind"] == "paired_geometry_input_scaling"
+            assert tail["input_scaling"] == modes[arm]
+            if selective:
+                assert report["study_variant"] == tail["study_variant"] == "selective_profile_floor_1pct"
+    for reference, candidate in mocked_input_scaling["gate_calls"]:
+        assert all(report["predictor"] == "cdp_column_scaling_ensemble" for report in reference.values())
+        assert all(report["member_seeds"] == [42, 43, 44] and "seed" not in report for report in reference.values())
+        assert all(report["predictor"] == "cdp_profile_scaling_ensemble" for report in candidate.values())
+
+
+def test_input_scaling_pooled_r2_is_direct_not_mean_fold_r2(cloud, frozen, mocked_input_scaling):
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    output, train = mocked_input_scaling["output"], frozen[0].train
+    summary = pd.read_csv(output / "summary.csv")
+    pooled_csv = pd.read_csv(output / "pooled_oof_metrics.csv")
+    assert len(pooled_csv) == 6
+    for arm in ("cdp_column_scaling", "cdp_profile_scaling"):
+        family = f"{arm}_ensemble"
+        aligned, counts = np.empty((len(train), 3)), np.zeros(len(train), dtype=int)
+        for fold in range(3):
+            with np.load(output / result["prediction_artifacts"][str(fold)][arm]["path"], allow_pickle=False) as arrays:
+                positions = arrays["canonical_train_positions"]
+                aligned[positions] = arrays["physical_ensemble_predictions"]
+                counts[positions] += 1
+        assert (counts == 1).all()
+        pooled = result["pooled_oof"][family]
+        if mocked_input_scaling["candidate_mode"] == "profile_rms_floor_1pct":
+            mode = "standard" if arm == "cdp_column_scaling" else "profile_rms_floor_1pct"
+            assert pooled["input_scaling"] == mode
+            assert pooled["study_variant"] == "selective_profile_floor_1pct"
+            assert set(pooled_csv.loc[pooled_csv.predictor == family, "input_scaling"]) == {mode}
+        assert pooled["n_rows"] == len(train) and pooled["row_filtering"] is False
+        assert pooled["row_sha256"] == study._row_hash(train)
+        for index, target in enumerate(TARGETS):
+            assert pooled["targets"][target] == {**regression_metrics(train[target].to_numpy(), aligned[:, index]), "r2_status": "defined"}
+            mean_r2 = summary.loc[(summary.predictor == family) & (summary.metric == "r2") & (summary.target == target), "mean"].item()
+            assert pooled["targets"][target]["r2"] != pytest.approx(mean_r2, abs=1e-10)
+
+
+@pytest.mark.parametrize("bad", ["missing", "duplicate", "out_of_range", "float", "wrong_shape", "nonfinite", "missing_fold"])
+def test_pooled_oof_rejects_incomplete_or_misaligned_coverage(frozen, bad):
+    train = frozen[0].train
+    positions = fold_study._geometry_folds(train)[0]
+    records = {fold: (pos["evaluation"].copy(), train.iloc[pos["evaluation"]][TARGETS].to_numpy()) for fold, pos in positions.items()}
+    pos, prediction = records[2]
+    if bad == "missing":
+        records[2] = (pos[:-1], prediction[:-1])
+    elif bad == "duplicate":
+        pos[0] = records[0][0][0]
+    elif bad == "out_of_range":
+        pos[0] = len(train)
+    elif bad == "float":
+        records[2] = (pos.astype(float), prediction)
+    elif bad == "wrong_shape":
+        records[2] = (pos, prediction[:, :2])
+    elif bad == "nonfinite":
+        prediction[0, 1] = np.nan
+    else:
+        del records[2]
+    with pytest.raises(ValueError, match="Pooled OOF"):
+        fold_study._pooled_oof_scores(train, TARGETS, records)
+
+
+@pytest.mark.parametrize("target", TARGETS)
+@pytest.mark.parametrize("r2", [0., -1.])
+def test_input_scaling_negative_r2_veto_is_separate_from_passing_relative_gate(cloud, frozen, mocked_input_scaling, monkeypatch, target, r2):
+    original = fold_study.tail_report
+
+    def report(*args, **kwargs):
+        result = original(*args, **kwargs)
+        # Each fold has six members and two ensemble reports; candidate ensemble is last.
+        if len(mocked_input_scaling["reports"]) == 24:
+            result["targets"][target]["r2"] = r2
+        return result
+
+    monkeypatch.setattr(fold_study, "tail_report", report)
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    selection = result["selection"]
+    assert selection["relative_gate_passed"] and not selection["candidate_numerically_safe"]
+    assert selection["selected_family"] is None and selection["new_recommendation"] is False
+    assert selection["numerical_safety"]["cdp_profile_scaling_ensemble"]["status"] == "fail"
+    assert len(selection["numerical_safety"]["cdp_profile_scaling_ensemble"]["checks"]) == 12
+    assert selection["member_seeds"] == [] and selection["fallback_family"] is None and selection["production_promotion"] is False
+
+
+def test_input_scaling_candidate_clipping_and_unsafe_reference_are_never_recommended(cloud, frozen, mocked_input_scaling):
+    mocked_input_scaling.update(clip=(2, 44, "cdp_profile_scaling"))
+    mocked_input_scaling["factors"]["cdp_column_scaling"] = [.1, .11, .12]
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    selection = result["selection"]
+    assert selection["selected_family"] is None and not selection["new_recommendation"]
+    assert not selection["candidate_numerically_safe"] and not selection["reference_numerically_safe"]
+    assert selection["numerical_safety"]["cdp_profile_scaling_ensemble"]["status"] == "fail"
+    report = read_json(mocked_input_scaling["output"] / result["numerical_reports"]["2"]["cdp_profile_scaling"])
+    assert report["n_member_values_clipped"] == report["n_rows_any_clipped"] == 1
+    with np.load(mocked_input_scaling["output"] / result["prediction_artifacts"]["2"]["cdp_profile_scaling"]["path"], allow_pickle=False) as arrays:
+        assert arrays["upper_clipped"].sum() == 1
+        assert arrays["fitting_predictions"][2, 0, 1] > np.log(INVERSE_LIMITS[1])
+        assert arrays["physical_predictions"][2, 0, 1] == pytest.approx(INVERSE_LIMITS[1])
+
+
+@pytest.mark.parametrize("bad", ["missing_fold", "missing_member", "missing_count", "missing_r2", "undefined_r2", "missing_spread"])
+def test_input_scaling_missing_safety_evidence_is_inconclusive_no_recommendation(cloud, frozen, mocked_input_scaling, monkeypatch, bad):
+    original = fold_study._input_scaling_safety
+
+    def safety(ensembles, numerics):
+        ensembles, numerics = deepcopy(ensembles), deepcopy(numerics)
+        if bad == "missing_fold":
+            del numerics[2]
+        elif bad == "missing_member":
+            numerics[2]["per_member"].pop()
+        elif bad == "missing_count":
+            del numerics[2]["n_member_values_clipped"]
+        elif bad == "missing_r2":
+            del ensembles[2]["targets"]["Cl"]["r2"]
+        elif bad == "undefined_r2":
+            ensembles[2]["targets"]["Cl"]["r2"] = None
+        else:
+            del numerics[2]["raw_log_Cd_std_summary"]
+        return original(ensembles, numerics)
+
+    monkeypatch.setattr(fold_study, "_input_scaling_safety", safety)
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    assert result["selection"]["relative_gate_passed"]
+    assert result["selection"]["selected_family"] is None
+    assert all(item["status"] == "inconclusive" and item["errors"] for item in result["selection"]["numerical_safety"].values())
+
+
+@pytest.mark.parametrize("bad", ["shape", "nonfinite", "nonfinite_log", "complex", "strings"])
+def test_input_scaling_raw_errors_checkpoint_and_do_not_select(cloud, frozen, mocked_input_scaling, bad):
+    mocked_input_scaling["bad_prediction"] = bad
+    with pytest.raises(ValueError, match="finite raw fitting-space"):
+        run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    manifest = read_json(mocked_input_scaling["output"] / "fold_study.json")
+    assert manifest["status"] == "error" and manifest["completed_fits"] == 6
+    assert manifest["completed_member_evaluations"] == manifest["completed_ensemble_evaluations"] == 0
+    assert manifest["trials"]["fold_0_seed_42_cdp_column_scaling"]["evaluation_status"] == "error"
+    assert not (mocked_input_scaling["output"] / "fold_selection.json").exists()
+
+
+def test_input_scaling_partial_prediction_artifact_honest_on_missing_member(cloud, frozen, mocked_input_scaling, monkeypatch):
+    original = fold_study.joblib.load
+
+    def load(path):
+        if "seed_43_cdp_column_scaling" in str(path):
+            raise FileNotFoundError("missing evaluation member")
+        return original(path)
+
+    monkeypatch.setattr(fold_study.joblib, "load", load)
+    with pytest.raises(FileNotFoundError, match="missing evaluation member"):
+        run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    manifest = read_json(mocked_input_scaling["output"] / "fold_study.json")
+    artifact = manifest["prediction_artifacts"]["0"]["cdp_column_scaling"]
+    assert manifest["status"] == "error" and manifest["completed_member_evaluations"] == 1
+    assert artifact["status"] == "partial" and artifact["n_members"] == 1 and not artifact["ensemble_present"]
+    with np.load(mocked_input_scaling["output"] / artifact["path"], allow_pickle=False) as arrays:
+        assert arrays["fitting_predictions"].shape[0] == arrays["physical_predictions"].shape[0] == 1
+        np.testing.assert_array_equal(arrays["member_seeds"], [42])
+        assert "physical_ensemble_predictions" not in arrays
+        if mocked_input_scaling["candidate_mode"] == "profile_rms_floor_1pct":
+            assert arrays["input_scaling"].item() == "standard"
+            assert arrays["study_variant"].item() == "selective_profile_floor_1pct"
+    assert not (mocked_input_scaling["output"] / "fold_selection.json").exists()
+
+
+@pytest.mark.parametrize("fail_at", [1, 7, 18])
+def test_input_scaling_fit_failure_and_fresh_guard(cloud, frozen, mocked_input_scaling, fail_at):
+    mocked_input_scaling["fail_at"] = fail_at
+    with pytest.raises(RuntimeError, match="intentional mock failure"):
+        run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    output = mocked_input_scaling["output"]
+    manifest = read_json(output / "fold_study.json")
+    assert manifest["status"] == "error" and manifest["completed_fits"] == fail_at - 1
+    assert manifest["selection"] is None and not (output / "fold_selection.json").exists()
+    with pytest.raises(FileExistsError):
+        run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    assert len(mocked_input_scaling["calls"]) == fail_at
+
+
+def test_input_scaling_never_touches_poisoned_canonical_holdouts(cloud, frozen, mocked_input_scaling):
+    class PoisonHoldout(pd.DataFrame):
+        @property
+        def _constructor(self):
+            return pd.DataFrame
+
+        def __getitem__(self, key):
+            names = [key] if isinstance(key, str) else list(key)
+            assert set(names).issubset(study._ROW_KEYS), "Canonical holdout feature/label access is forbidden."
+            return super().__getitem__(key)
+
+        @property
+        def iloc(self):
+            raise AssertionError("Do not materialize canonical holdout rows.")
+
+    for name in ("validation", "test"):
+        setattr(frozen[0], name, PoisonHoldout(getattr(frozen[0], name)))
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    assert result["canonical_validation_test_used_for_model_apis"] is False
+    assert result["selection"]["canonical_validation_scored"] is result["selection"]["canonical_test_scored"] is False
+
+
+def test_input_scaling_no_public_sweep_and_guard_before_split_access(tmp_path, monkeypatch):
+    monkeypatch.setattr(study, "_KAGGLE_WORKING", tmp_path / "absent")
+    with pytest.raises(RuntimeError, match="only on Kaggle"):
+        fold_study.run_input_scaling_fold_study(None, FEATURES, TARGETS, tmp_path / "no-output")
+    with pytest.raises(TypeError, match="candidate_scaling"):
+        fold_study.run_input_scaling_fold_study(None, FEATURES, TARGETS, tmp_path / "no-output", candidate_scaling="other")
+    assert not (tmp_path / "no-output").exists()
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_input_scaling_constant_fold_target_is_undefined_not_force_finite_pass(cloud, frozen, mocked_input_scaling, target):
+    train = frozen[0].train
+    train.loc[train.index[mocked_input_scaling["positions"][0]["evaluation"]], target] = .2 if target == "Cl" else .01
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    selection = result["selection"]
+    assert selection["selected_family"] is None and not selection["new_recommendation"]
+    assert selection["gates"]["cdp_profile_scaling_ensemble"]["status"] == "inconclusive"
+    assert all(item["status"] == "inconclusive" for item in selection["numerical_safety"].values())
+    report = read_json(mocked_input_scaling["output"] / result["ensemble_reports"]["0"]["cdp_profile_scaling"])
+    assert report["targets"][target]["r2"] is None
+    assert report["targets"][target]["r2_status"] == "undefined_constant_target"
+    assert result["pooled_oof"]["cdp_profile_scaling_ensemble"]["targets"][target]["r2_status"] == "defined"
+    summary = pd.read_csv(mocked_input_scaling["output"] / "summary.csv")
+    summary = summary.loc[(summary.predictor == "cdp_profile_scaling_ensemble") & (summary.target == target) & (summary.metric == "r2")]
+    assert summary.status.item() == "inconclusive" and summary.n_defined.item() == 2
+
+
+def test_pooled_oof_constant_target_preserves_metrics_but_marks_r2_undefined(frozen):
+    train = frozen[0].train.copy()
+    train["Cd"] = .01
+    positions = fold_study._geometry_folds(train)[0]
+    records = {fold: (pos["evaluation"], train.iloc[pos["evaluation"]][TARGETS].to_numpy()) for fold, pos in positions.items()}
+    assert regression_metrics(train.Cd, train.Cd)["r2"] == 1.
+    report = fold_study._pooled_oof_scores(train, TARGETS, records)
+    assert report["targets"]["Cd"]["r2"] is None
+    assert report["targets"]["Cd"]["r2_status"] == "undefined_constant_target"
+    assert report["targets"]["Cd"]["rmse"] == 0.
+
+
+def test_input_scaling_finalization_error_preserves_once_written_selection(cloud, frozen, mocked_input_scaling, monkeypatch):
+    original = study._write_csv
+
+    def write(path, records):
+        if path.name == "summary.csv":
+            raise OSError("summary disk error")
+        return original(path, records)
+
+    monkeypatch.setattr(study, "_write_csv", write)
+    with pytest.raises(OSError, match="summary disk error"):
+        run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    output = mocked_input_scaling["output"]
+    manifest = read_json(output / "fold_study.json")
+    assert manifest["status"] == "error" and manifest["completed_fits"] == 18
+    assert manifest["selection"] == read_json(output / "fold_selection.json")
+    assert manifest["selection"]["selected_family"] == "cdp_profile_scaling_ensemble"
+    assert (output / "numerical_safety.json").is_file() and (output / "pooled_oof_metrics.csv").is_file()
+    assert all(artifact["status"] == "complete" for fold in manifest["prediction_artifacts"].values() for artifact in fold.values())
+    before = (output / "fold_selection.json").read_bytes()
+    with pytest.raises(FileExistsError):
+        run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    assert (output / "fold_selection.json").read_bytes() == before
+
+
+def test_input_scaling_failing_relative_gate_alone_is_not_new_recommendation(cloud, frozen, mocked_input_scaling):
+    mocked_input_scaling["factors"] = {"cdp_column_scaling": [.001, .002, .003], "cdp_profile_scaling": [.005, .006, .007]}
+    result = run_scaling_mock(cloud, frozen, mocked_input_scaling)
+    selection = result["selection"]
+    assert selection["candidate_numerically_safe"] and selection["reference_numerically_safe"]
+    assert not selection["relative_gate_passed"]
+    assert selection["selected_family"] is None and not selection["new_recommendation"]
+    assert selection["fallback_family"] is None and selection["production_promotion"] is False
+
+
+def test_nonfinite_raw_safety_report_is_error_not_inconclusive():
+    with pytest.raises(ValueError, match="nonfinite raw"):
+        fold_study._input_scaling_safety({}, {0: {"n_nonfinite": 1}})
+
+
+def test_selective_wrapper_signature_and_bounded_engine_delegation(monkeypatch):
+    assert inspect.signature(fold_study.run_selective_scaling_fold_study) == inspect.signature(fold_study.run_input_scaling_fold_study)
+    calls = []
+
+    def engine(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "mock manifest"
+
+    monkeypatch.setattr(fold_study, "_run_fold_study", engine)
+    args = (object(), FEATURES, TARGETS, Path("unused"), {"mock": True}, "cpu")
+    assert fold_study.run_input_scaling_fold_study(*args) == "mock manifest"
+    assert fold_study.run_selective_scaling_fold_study(*args) == "mock manifest"
+    assert calls == [(args, {"input_scaling": "profile_rms_floor"}), (args, {"input_scaling": "profile_rms_floor_1pct"})]
+
+
+@pytest.mark.parametrize("option", ["floor_ratio", "candidate_scaling", "input_scaling", "sweep"])
+def test_selective_wrapper_has_no_public_ratio_or_sweep(tmp_path, option):
+    output = tmp_path / "no-output"
+    with pytest.raises(TypeError, match=option):
+        fold_study.run_selective_scaling_fold_study(None, FEATURES, TARGETS, output, **{option: .01})
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mode", [True, False, .01, {}, "standard", "profile_rms_floor_2pct"])
+def test_private_engine_rejects_unfrozen_modes_before_guard_fit_or_output(tmp_path, monkeypatch, mode):
+    def forbidden(*args):
+        pytest.fail("Invalid mode must fail before runtime/split access or output.")
+
+    monkeypatch.setattr(study, "_require_kaggle", forbidden)
+    output = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="predeclared"):
+        fold_study._run_fold_study(None, FEATURES, TARGETS, output, None, "cpu", input_scaling=mode)
+    assert not output.exists()
+
+
+def test_selective_configs_validate_all_members_before_any_output(cloud, frozen, mocked_training, monkeypatch):
+    original = TorchMLPRegressor._validate_params
+    validated = []
+    output = cloud / "invalid-config"
+
+    def validate(model):
+        assert not output.exists() and not mocked_training["calls"]
+        validated.append((model.random_state, model.input_scaling, model.auxiliary_weight))
+        if len(validated) == 18:
+            raise ValueError("invalid final frozen config")
+        return original(model)
+
+    monkeypatch.setattr(TorchMLPRegressor, "_validate_params", validate)
+    with pytest.raises(ValueError, match="invalid final frozen config"):
+        fold_study.run_selective_scaling_fold_study(frozen[0], FEATURES, TARGETS, output, frozen[1], device="cpu")
+    assert len(validated) == 18 and not output.exists() and not mocked_training["calls"]
+    assert validated == [(seed, mode, .1) for _ in range(3) for seed in (42, 43, 44)
+                         for mode in ("standard", "profile_rms_floor_1pct")]
+
+
+def test_selective_guard_precedes_split_access(tmp_path, monkeypatch):
+    monkeypatch.setattr(study, "_KAGGLE_WORKING", tmp_path / "absent")
+    with pytest.raises(RuntimeError, match="only on Kaggle"):
+        fold_study.run_selective_scaling_fold_study(None, FEATURES, TARGETS, tmp_path / "no-output")
     assert not (tmp_path / "no-output").exists()

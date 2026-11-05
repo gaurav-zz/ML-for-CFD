@@ -22,11 +22,16 @@ from src.training import study
 from src.training.auxiliary_study import _auxiliary_values
 from src.training.comparison import SCORE_COLUMNS, _write_json, compare_models
 from src.training.tail_risk import SEEDS, TAIL_METRICS, derive_thresholds, tail_report
-from src.training.targets import DEFAULT_TARGET_TRANSFORMS, PhysicalPredictor
+from src.training.targets import DEFAULT_TARGET_TRANSFORMS, INVERSE_LIMITS, PhysicalPredictor, inverse_targets
+from src.utils.metrics import regression_metrics
 
 
 _PARTITION_SEED = 20261026
 _ARMS = ("baseline", "cdp")
+_INPUT_SCALING_ARMS = ("cdp_column_scaling", "cdp_profile_scaling")
+_INPUT_SCALING_MODES = dict(zip(_INPUT_SCALING_ARMS, ("standard", "profile_rms_floor")))
+_INPUT_SCALING_STUDY_KIND = "paired_geometry_input_scaling"
+_SELECTIVE_STUDY_VARIANT = "selective_profile_floor_1pct"
 _SOURCE = "canonical_train_geometry_fold_evaluation"
 _GEOMETRY_COUNT = 572
 _METHOD = "mean_Cl_Cm_geometric_mean_Cd"
@@ -97,6 +102,10 @@ def _metric_rows(report, **metadata):
         row = {**metadata, "source": _SOURCE, "target": target, **values,
                "n_predictions": report["n_rows"], "row_sha256": report["row_sha256"],
                "geometry_sha256": _geometry_hash(report["geometry_ids"])}
+        if "study_kind" in report:
+            row.update(study_kind=report["study_kind"], input_scaling=report["input_scaling"])
+        if "study_variant" in report:
+            row["study_variant"] = report["study_variant"]
         if target == "Cd":
             row.update(report["cd_tail"])
             row.update({f"{name}_rmse": report["stress"][name]["Cd_rmse"] for name in ("low_re", "thick")})
@@ -130,7 +139,163 @@ def _descriptive_summary(member_rows, ensemble_rows):
                 "weighting": "unweighted folds" if count_key == "n_folds" else "unweighted seeds within this fold",
                 "predictions_ensembled_across_folds": False,
             })
+            if "study_kind" in group:
+                summaries[-1].update(study_kind=group["study_kind"].iloc[0], input_scaling=group["input_scaling"].iloc[0])
+            if "study_variant" in group:
+                summaries[-1]["study_variant"] = group["study_variant"].iloc[0]
     return summaries
+
+
+def _write_predictions(path, **arrays):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **arrays)
+    temporary.replace(path)
+
+
+def _mark_r2_definition(report, actual):
+    # sklearn's force_finite default masks undefined constant-target R2 as 0/1.
+    for index, values in enumerate(report["targets"].values()):
+        status = "undefined_insufficient_rows" if len(actual) < 2 else (
+            "undefined_constant_target" if np.all(actual[:, index] == actual[0, index]) else "defined"
+        )
+        values["r2_status"] = status
+        if status != "defined":
+            values["r2"] = None
+
+
+def _pooled_oof_scores(train, targets, fold_predictions):
+    """Align one evaluation prediction per original row before direct scoring."""
+    if (not isinstance(fold_predictions, dict) or set(fold_predictions) != {0, 1, 2}
+            or any(type(fold) is not int for fold in fold_predictions)):
+        raise ValueError("Pooled OOF scoring requires exactly all three geometry folds.")
+    covered = np.zeros(len(train), dtype=int)
+    aligned = np.empty((len(train), len(targets)), dtype=float)
+    for fold in range(3):
+        positions, predictions = fold_predictions[fold]
+        positions, predictions = np.asarray(positions), np.asarray(predictions, dtype=float)
+        if (positions.ndim != 1 or positions.dtype.kind not in "iu" or not len(positions)
+                or (positions < 0).any() or (positions >= len(train)).any()
+                or len(np.unique(positions)) != len(positions)
+                or predictions.shape != (len(positions), len(targets)) or not np.isfinite(predictions).all()):
+            raise ValueError("Pooled OOF predictions require finite complete arrays and unique in-range canonical-train positions.")
+        covered[positions] += 1
+        aligned[positions] = predictions
+    if not (covered == 1).all():
+        raise ValueError("Pooled OOF coverage must include every canonical-train position exactly once, without dropped or duplicated rows.")
+    actual = train[targets].to_numpy(dtype=float)
+    if not np.isfinite(actual).all():
+        raise ValueError("Pooled OOF primary labels must be finite on every canonical-train row.")
+    report = {
+        "schema_version": 1, "source": _SOURCE, "study_kind": _INPUT_SCALING_STUDY_KIND,
+        "score_scope": "pooled_oof_all_canonical_train_rows", "n_rows": len(train),
+        "row_sha256": study._row_hash(train), "geometry_ids": sorted(train.geometry_id.unique()),
+        "coverage": "each canonical_train_position exactly once", "n_folds": 3,
+        "row_filtering": False, "predictions_ensembled_across_folds": False,
+        "r2_aggregation": "direct regression_metrics on aligned rows; not average fold R2",
+        "targets": {target: regression_metrics(actual[:, index], aligned[:, index])
+                    for index, target in enumerate(targets)},
+    }
+    _mark_r2_definition(report, actual)
+    json.dumps(report, allow_nan=False)
+    return report
+
+
+def _input_scaling_safety(ensemble_reports, numerical_reports):
+    """Keep absolute sanity screens separate from the relative engineering gate."""
+    result = {
+        "schema_version": 1, "source": _SOURCE, "study_kind": _INPUT_SCALING_STUDY_KIND,
+        "status": "inconclusive", "passed": False, "n_folds": 3, "member_seeds": list(SEEDS),
+        "checks": [], "errors": [], "reasons": [], "production_promotion": False,
+        "policy": {"primary_r2": "strictly > 0 for every Cl/Cd/Cm ensemble target in every fold",
+                   "clipping": "no pre-inverse-log bound crossings in any of the three members on any row",
+                   "missing_evidence": "inconclusive", "nonfinite_raw_predictions": "error",
+                   "description": "Minimal numerical sanity screens, not physical accuracy guarantees."},
+    }
+    # Raw nonfinite evidence is an evaluation error, never a completed safety veto.
+    if isinstance(numerical_reports, dict):
+        for item in numerical_reports.values():
+            if isinstance(item, dict) and isinstance(item.get("n_nonfinite"), (int, float)) and item["n_nonfinite"] > 0:
+                raise ValueError("Numerical safety received nonfinite raw fitting-space predictions.")
+    try:
+        for supplied in (ensemble_reports, numerical_reports):
+            if (not isinstance(supplied, dict) or set(supplied) != {0, 1, 2}
+                    or any(type(fold) is not int for fold in supplied)):
+                raise ValueError("Numerical safety requires complete evidence for all three geometry folds.")
+        for fold in range(3):
+            ensemble, numerical = ensemble_reports[fold], numerical_reports[fold]
+            json.dumps((ensemble, numerical), allow_nan=False)
+            if (numerical["schema_version"] != 1 or type(numerical["schema_version"]) is not int
+                    or numerical["status"] != "complete" or numerical["target_names"] != ["Cl", "Cd", "Cm"]
+                    or numerical["member_seeds"] != list(SEEDS)
+                    or any(type(seed) is not int for seed in numerical["member_seeds"])
+                    or type(numerical["n_nonfinite"]) is not int or numerical["n_nonfinite"] != 0
+                    or numerical["inverse_limits"] != list(INVERSE_LIMITS)
+                    or numerical["calibrated_uncertainty"] is not False):
+                raise ValueError("Numerical safety requires complete finite raw evidence from all ordered members and unchanged inverse limits.")
+            for key in ("fold_id", "source", "study_kind", "predictor", "arm", "input_scaling", "n_rows", "n_geometries", "row_sha256"):
+                if numerical[key] != ensemble[key]:
+                    raise ValueError(f"Fold {fold} numerical and ensemble {key} identities must match.")
+            if (ensemble["fold_id"] != fold or type(ensemble["fold_id"]) is not int
+                    or ensemble["study_kind"] != _INPUT_SCALING_STUDY_KIND or ensemble["source"] != _SOURCE
+                    or ensemble["member_seeds"] != list(SEEDS) or ensemble["aggregation"] != _METHOD
+                    or ensemble["predictor"] != ensemble_reports[0]["predictor"]):
+                raise ValueError("Numerical safety requires one truthful, complete input-scaling ensemble family across all folds.")
+            n_rows = ensemble["n_rows"]
+            if type(n_rows) is not int or n_rows <= 0:
+                raise ValueError("Numerical safety requires a positive evaluation row count.")
+            members = numerical["per_member"]
+            if len(members) != 3 or [row["seed"] for row in members] != list(SEEDS):
+                raise ValueError("Numerical safety requires clipping counts for every ordered seed.")
+            clipped = 0
+            for row in members:
+                if type(row["seed"]) is not int:
+                    raise ValueError("Numerical safety member seeds must be integers.")
+                for name in ("n_lower_clipped", "n_upper_clipped"):
+                    if type(row[name]) is not int or not 0 <= row[name] <= n_rows:
+                        raise ValueError("Numerical safety clipping counts must be complete nonnegative integers.")
+                    clipped += row[name]
+                if row["n_lower_clipped"] + row["n_upper_clipped"] > n_rows:
+                    raise ValueError("Member clipping counts cannot exceed its evaluation row count.")
+            geometry = numerical["per_geometry"]
+            if (len(geometry) != ensemble["n_geometries"]
+                    or [[row["geometry_id"], row["n_rows"]] for row in geometry]
+                    != [[row["geometry_id"], row["n_rows"]] for row in ensemble["per_geometry"]]):
+                raise ValueError("Numerical safety requires complete matching per-geometry row counts.")
+            for row in geometry:
+                for name in ("n_rows_any_clipped", "zero_clipped_spread_nonzero_raw_rows"):
+                    if type(row[name]) is not int or not 0 <= row[name] <= row["n_rows"]:
+                        raise ValueError("Numerical safety per-geometry clipping/spread counts are incomplete.")
+            for name in ("n_rows_any_clipped", "zero_clipped_spread_nonzero_raw_rows"):
+                if type(numerical[name]) is not int or numerical[name] != sum(row[name] for row in geometry):
+                    raise ValueError("Numerical safety row clipping/spread totals must match geometry evidence.")
+            if (type(numerical["n_member_values_clipped"]) is not int or numerical["n_member_values_clipped"] != clipped
+                    or not numerical["n_rows_any_clipped"] <= clipped <= 3 * numerical["n_rows_any_clipped"]
+                    or type(numerical["safe_no_clipping"]) is not bool or numerical["safe_no_clipping"] != (clipped == 0)):
+                raise ValueError("Numerical safety no-clipping status must match all member and row counts.")
+            for name in ("raw_log_Cd_std_summary", "clipped_log_Cd_std_summary"):
+                values = [numerical[name][key] for key in ("min", "mean", "max")]
+                if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) for value in values)
+                        or not 0 <= values[0] <= values[1] <= values[2]):
+                    raise ValueError("Numerical safety requires finite complete raw and clipped spread summaries.")
+            for target in ("Cl", "Cd", "Cm"):
+                value = ensemble["targets"][target]["r2"]
+                if (ensemble["targets"][target]["r2_status"] != "defined" or isinstance(value, bool)
+                        or not isinstance(value, (int, float)) or not np.isfinite(value)):
+                    raise ValueError("Numerical safety requires defined finite primary ensemble R2 for every target/fold.")
+                result["checks"].append({"fold_id": fold, "target": target, "rule": "primary_r2_strictly_positive",
+                                         "value": value, "passed": value > 0})
+            result["checks"].append({"fold_id": fold, "rule": "no_member_pre_inverse_log_clipping",
+                                     "n_member_values_clipped": clipped, "passed": clipped == 0})
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError) as error:
+        result["checks"] = []
+        result["errors"].append(str(error))
+        result["reasons"].append(str(error))
+        return result
+    result["reasons"] = [f"fold={row['fold_id']} {row['rule']} failed" + (f" for {row['target']}" if "target" in row else "")
+                         for row in result["checks"] if not row["passed"]]
+    result.update(status="fail" if result["reasons"] else "pass", passed=not result["reasons"])
+    return result
 
 
 def run_fold_study(split, feature_columns, target_names, output_dir, run_metadata=None, device="cuda"):
@@ -143,7 +308,39 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
     No production models, pins, uploads, confirmation fits or holdout scores are
     produced. Explicit CPU still requires the existing Kaggle runtime guard.
     """
+    return _run_fold_study(split, feature_columns, target_names, output_dir, run_metadata, device)
+
+
+def run_input_scaling_fold_study(split, feature_columns, target_names, output_dir, run_metadata=None, device="cuda"):
+    """Run the frozen 18-fit column/profile scaling comparison with Cdp in both arms.
+
+    All evaluation rows are canonical train OOF rows. A new recommendation needs
+    both the relative fold gate and numerical safety; there is no fallback family
+    or production promotion. Raw fitting-space predictions are retained for replay.
+    """
+    return _run_fold_study(split, feature_columns, target_names, output_dir, run_metadata, device,
+                           input_scaling="profile_rms_floor")
+
+
+def run_selective_scaling_fold_study(split, feature_columns, target_names, output_dir, run_metadata=None, device="cuda"):
+    """Run exactly 18 fresh fits comparing standard-Cdp with selective-floor Cdp.
+
+    The candidate fixes input_scaling='profile_rms_floor_1pct': 0.01 times the RMS
+    of the same 100 inner-fit/reflected profile SDs. No ratio or sweep is exposed.
+    Everything else, including folds, seeds, Cdp weight and safety, is unchanged.
+    """
+    return _run_fold_study(split, feature_columns, target_names, output_dir, run_metadata, device,
+                           input_scaling="profile_rms_floor_1pct")
+
+
+def _run_fold_study(split, feature_columns, target_names, output_dir, run_metadata, device, *, input_scaling=None):
+    if input_scaling is not None and (not isinstance(input_scaling, str)
+            or input_scaling not in ("profile_rms_floor", "profile_rms_floor_1pct")):
+        raise ValueError("Fold study requires a predeclared full-RMS or selective 1%-RMS mode.")
     output = study._require_kaggle(output_dir, device)
+    arms = _INPUT_SCALING_ARMS if input_scaling else _ARMS
+    scaling_modes = {**_INPUT_SCALING_MODES, _INPUT_SCALING_ARMS[1]: input_scaling}
+    variant_metadata = {"study_variant": _SELECTIVE_STUDY_VARIANT} if input_scaling == "profile_rms_floor_1pct" else {}
     metadata = deepcopy({} if run_metadata is None else run_metadata)
     if not isinstance(metadata, dict):
         raise ValueError("run_metadata must be a mapping with frozen split and auxiliary provenance.")
@@ -165,6 +362,8 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
     if missing:
         raise ValueError(f"Canonical train lacks required auxiliary/stress columns: {sorted(missing)}.")
     positions, fold_plan, fold_rows = _geometry_folds(train)
+    if input_scaling:
+        fold_plan.update(study_kind=_INPUT_SCALING_STUDY_KIND, **variant_metadata)
     for fold_id, pos in positions.items():
         fit = train.iloc[pos["fit"]]
         if not np.isfinite(_auxiliary_values(fit)).any():
@@ -178,7 +377,12 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
     # Helpers are pure NumPy, imported at runtime to keep orchestration importable
     # independently of cloud wiring and to avoid constructing an inference model.
     from src.models.ensemble import aggregate_predictions, disagreement_report
-    from src.training.fold_gate import POLICY as FOLD_POLICY, paired_fold_gate
+    from src.training.fold_gate import (
+        POLICY as FOLD_POLICY, paired_fold_gate, paired_input_scaling_fold_gate, paired_selective_scaling_fold_gate,
+    )
+
+    if input_scaling:
+        from src.training.numerical_safety import numerical_report
 
     defaults = TorchMLPRegressor().get_params(deep=False)
     defaults.pop("target_names")
@@ -191,21 +395,27 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
     trials = {}
     for fold_id in range(3):
         for seed in SEEDS:
-            for arm in _ARMS:
+            for arm in arms:
                 trial_id = f"fold_{fold_id}_seed_{seed}_{arm}"
                 trials[trial_id] = {
                     "fold_id": fold_id, "seed": seed, "arm": arm, "status": "pending",
                     "config": {"name": "torch_mlp_huber", "scale_targets": False,
-                               "parameters": {**defaults, "random_state": seed, "auxiliary_weight": .1 if arm == "cdp" else 0.}},
+                                "parameters": {**defaults, "random_state": seed,
+                                               "auxiliary_weight": .1 if input_scaling or arm == "cdp" else 0.,
+                                                **({"input_scaling": scaling_modes[arm]} if input_scaling else {})}},
                     "manifest": f"trials/{trial_id}/run.json",
                 }
+    if input_scaling:
+        # Parameter validation is fit-free and must precede output or any member fit.
+        for trial in trials.values():
+            TorchMLPRegressor(target_names=tuple(targets), **trial["config"]["parameters"])._validate_params()
     manifest = {
         "schema_version": 1, "status": "planned", "phase": "planned", "source": _SOURCE,
         "run_metadata": metadata, "hardware": metadata.get("gpu", {}), "device": device,
         "feature_columns": features, "target_names": targets, "target_transforms": DEFAULT_TARGET_TRANSFORMS.copy(),
         "canonical_split": canonical, "canonical_validation_test_used_for_model_apis": False,
         "plan": {
-            "estimated_fits": 18, "n_folds": 3, "seeds": list(SEEDS), "arms": list(_ARMS),
+            "estimated_fits": 18, "n_folds": 3, "seeds": list(SEEDS), "arms": list(arms),
             "trial_order": list(trials), "trial_configs": {key: deepcopy(value["config"]) for key, value in trials.items()},
             "fold_plan": fold_plan, "optimizer": "RAdam", "stopping_metric": "primary_normalized_validation_loss",
             "scalers": "inner-fit only; auxiliary scaler uses observed inner-fit Cdp only",
@@ -228,6 +438,36 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
                       "ensembles": "ensemble_metrics.csv", "disagreement": "disagreement.json", "gates": "gates.json",
                       "summary": "summary.csv", "selection": "fold_selection.json"},
     }
+    if input_scaling:
+        manifest.update(study_kind=_INPUT_SCALING_STUDY_KIND, production_promotion=False,
+                        numerical_reports={}, prediction_artifacts={}, pooled_oof=None, **variant_metadata)
+        manifest["plan"].update(
+            reference=f"{arms[0]}_ensemble", candidate_order=[f"{arms[1]}_ensemble"],
+            selection_metric="candidate only when relative gate and numerical safety both pass",
+            tie_break=None, fallback=None, controlled_parameter="input_scaling",
+            input_scaling_modes=deepcopy(scaling_modes), **variant_metadata,
+            numerical_safety="Every fold ensemble must have Cl/Cd/Cm R2 > 0; no raw pre-inverse-log clipping in any member. Missing evidence is inconclusive.",
+            pooled_oof="Direct regression_metrics on all canonical-train rows aligned by original position; each row evaluated exactly once; never mean fold R2.",
+            evaluation="One raw fitting-space predict call per saved member; unchanged inverse_targets bounds; all rows including OOD retained.",
+            prediction_artifact_schema={
+                "canonical_train_positions": "original positional indices in canonical train, evaluation row order",
+                "member_seeds": "ordered evaluated seeds; partial artifacts contain only completed members",
+                "fitting_predictions": "(n_members,n_rows,3), Cl/logCd/Cm before inverse-log clipping",
+                "physical_predictions": "(n_members,n_rows,3), unchanged inverse_targets decoding",
+                "physical_ensemble_predictions": "(n_rows,3), present only after all members and aggregation succeed",
+                "lower_clipped": "(3,n_rows) bool, strict raw logCd < log(1e-6), complete artifacts only",
+                "upper_clipped": "(3,n_rows) bool, strict raw logCd > log(1e3), complete artifacts only",
+                "raw_log_Cd_std": "(n_rows,), raw fitting-space logCd member std with ddof=1",
+                "clipped_log_Cd_std": "(n_rows,), clipped logCd member std with ddof=1, not calibrated uncertainty",
+            },
+        )
+        if variant_metadata:
+            manifest["plan"]["prediction_artifact_schema"].update(
+                input_scaling="scalar Unicode string, exact arm mode", study_variant="scalar Unicode string, frozen variant",
+            )
+        manifest["artifacts"].update(numerical_reports="numerical_reports.json", numerical_safety="numerical_safety.json",
+                                     pooled_oof="pooled_oof.json", pooled_oof_metrics="pooled_oof_metrics.csv",
+                                     predictions="prediction_artifacts.json")
     json.dumps(manifest, allow_nan=False)
     output.mkdir(parents=True, exist_ok=False)
     _write_json(output / "fold_study.json", manifest)
@@ -237,7 +477,8 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
         _write_json(output / "fold_study.json", manifest)
 
     member_rows, ensemble_rows, disagreements = [], [], {}
-    references, candidates = {}, {arm: {} for arm in _ARMS}
+    references, candidates = {}, {arm: {} for arm in arms}
+    numerical_reports, oof_predictions = {arm: {} for arm in arms}, {arm: {} for arm in arms}
     try:
         _write_json(output / "folds.json", fold_plan)
         study._write_csv(output / "fold_rows.csv", fold_rows)
@@ -249,7 +490,7 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
             fit, stopping = train.iloc[pos["fit"]], train.iloc[pos["stopping"]]
             fit_aux, stop_aux = _auxiliary_values(fit), _auxiliary_values(stopping)
             for seed in SEEDS:
-                for arm in _ARMS:
+                for arm in arms:
                     current_trial = f"fold_{current_fold}_seed_{seed}_{arm}"
                     trial = trials[current_trial]
                     trial["status"] = "running"
@@ -273,12 +514,15 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
                                                "scaler_source": "canonical_train_inner_fit",
                                                "validation_use": "auxiliary diagnostics only"},
                     }
+                    if input_scaling:
+                        trial_metadata.update(study_kind=_INPUT_SCALING_STUDY_KIND,
+                                              input_scaling=scaling_modes[arm], **variant_metadata)
                     compare_models(
                         fit[features], fit[targets], stopping[features], stopping[targets], targets, trial_dir,
                         model_configs=[deepcopy(trial["config"])], run_metadata=trial_metadata,
                         target_transforms=DEFAULT_TARGET_TRANSFORMS.copy(), selection_metrics={"Cd": "median_relative_error"},
-                        auxiliary_train=fit_aux.copy() if arm == "cdp" else None,
-                        auxiliary_validation=stop_aux.copy() if arm == "cdp" else None,
+                        auxiliary_train=fit_aux.copy() if input_scaling or arm == "cdp" else None,
+                        auxiliary_validation=stop_aux.copy() if input_scaling or arm == "cdp" else None,
                     )
                     saved = json.loads((trial_dir / "run.json").read_text(encoding="utf-8"))
                     result = saved["results"][trial["config"]["name"]]
@@ -302,26 +546,58 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
             evaluation = train.iloc[pos["evaluation"]]
             diagnostics_frame = evaluation[[*study._ROW_KEYS, "max_thickness", *targets]]
             disagreements[current_fold], manifest["ensemble_reports"][current_fold] = {}, {}
-            for arm in _ARMS:
+            for arm in arms:
+                prediction_metadata = {"input_scaling": np.asarray(scaling_modes[arm]),
+                                       "study_variant": np.asarray(_SELECTIVE_STUDY_VARIANT)} if variant_metadata else {}
                 member_predictions = np.empty((3, len(evaluation), 3), dtype=float)
+                raw_predictions = np.empty_like(member_predictions) if input_scaling else None
+                directory = output / "folds" / f"fold_{current_fold}"
+                if input_scaling:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    prediction_path = f"folds/fold_{current_fold}/{arm}_predictions.npz"
                 for member_index, seed in enumerate(SEEDS):
                     current_trial = f"fold_{current_fold}_seed_{seed}_{arm}"
                     trial = trials[current_trial]
                     model = scored = predictions = None
                     try:
                         model = joblib.load(output / trial["model_path"])
-                        scored = PhysicalPredictor(model, targets, DEFAULT_TARGET_TRANSFORMS)
+                        if not input_scaling:
+                            scored = PhysicalPredictor(model, targets, DEFAULT_TARGET_TRANSFORMS)
                         started = time.perf_counter()
-                        predictions = scored.predict(evaluation[features])
+                        if input_scaling:
+                            raw = np.asarray(model.predict(evaluation[features]))
+                            if (raw.shape != (len(evaluation), 3) or raw.dtype.kind not in "iuf"
+                                    or not np.isfinite(raw).all()):
+                                raise ValueError("Every input-scaling fold member must return three finite raw fitting-space targets for all evaluation rows.")
+                            raw_predictions[member_index] = raw
+                            predictions = inverse_targets(raw, targets, DEFAULT_TARGET_TRANSFORMS)
+                            del raw
+                        else:
+                            predictions = scored.predict(evaluation[features])
                         elapsed = time.perf_counter() - started
                         if (np.shape(predictions) != (len(evaluation), 3) or not np.isfinite(predictions).all()
                                 or (predictions[:, 1] <= 0).any()):
                             raise ValueError("Every fold member must predict all evaluation rows and exactly three finite physical targets.")
                         member_predictions[member_index] = predictions
+                        if input_scaling:
+                            _write_predictions(output / prediction_path,
+                                               canonical_train_positions=pos["evaluation"],
+                                                member_seeds=np.asarray(SEEDS[:member_index + 1]),
+                                                fitting_predictions=raw_predictions[:member_index + 1],
+                                                physical_predictions=member_predictions[:member_index + 1], **prediction_metadata)
+                            manifest["prediction_artifacts"].setdefault(current_fold, {})[arm] = {
+                                "path": prediction_path, "status": "partial", "n_members": member_index + 1,
+                                "n_rows": len(evaluation), "ensemble_present": False,
+                                **({"input_scaling": scaling_modes[arm], **variant_metadata} if variant_metadata else {}),
+                            }
+                            _write_json(output / "prediction_artifacts.json", manifest["prediction_artifacts"])
                         report = tail_report(evaluation, predictions, targets, thresholds=fold["stress_thresholds"])
                         predictor = f"{arm}_seed_{seed}"
                         report.update(fold_id=current_fold, source=_SOURCE, predictor=predictor,
                                       member_seeds=[seed], seed=seed, arm=arm, trial_id=current_trial)
+                        if input_scaling:
+                            report.update(study_kind=_INPUT_SCALING_STUDY_KIND, input_scaling=scaling_modes[arm], **variant_metadata)
+                            _mark_r2_definition(report, evaluation[targets].to_numpy(dtype=float))
                         provenance = fold["partitions"]["evaluation"]
                         report.update(geometry_sha256=provenance["geometry_sha256"], fold_rows="../../fold_rows.csv")
                         path = f"trials/{current_trial}/fold_tail_report.json"
@@ -351,17 +627,39 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
                               member_seeds=list(SEEDS), aggregation=result["method"],
                               geometry_sha256=fold["partitions"]["evaluation"]["geometry_sha256"],
                               fold_rows="../../fold_rows.csv")
-                directory = output / "folds" / f"fold_{current_fold}"
+                if input_scaling:
+                    report.update(study_kind=_INPUT_SCALING_STUDY_KIND, input_scaling=scaling_modes[arm], **variant_metadata)
+                    _mark_r2_definition(report, evaluation[targets].to_numpy(dtype=float))
                 directory.mkdir(parents=True, exist_ok=True)
                 path = f"folds/fold_{current_fold}/{arm}_ensemble_tail_report.json"
                 _write_json(output / path, report)
                 diagnostics = disagreement_report(diagnostics_frame, result)
                 diagnostics.update(fold_id=current_fold, source=_SOURCE, predictor=predictor,
                                    member_seeds=list(SEEDS), aggregation=result["method"])
+                if input_scaling:
+                    diagnostics.update(study_kind=_INPUT_SCALING_STUDY_KIND, arm=arm, input_scaling=scaling_modes[arm], **variant_metadata)
                 disagreements[current_fold][arm] = diagnostics
                 _write_json(directory / f"{arm}_disagreement.json", diagnostics)
                 _write_json(output / "disagreement.json", disagreements)
                 candidates[arm][current_fold] = report
+                if input_scaling:
+                    if arm == arms[0]:
+                        references[current_fold] = report
+                    numerical, numerical_arrays = numerical_report(evaluation, raw_predictions)
+                    numerical.update(fold_id=current_fold, source=_SOURCE, predictor=predictor, arm=arm,
+                                     study_kind=_INPUT_SCALING_STUDY_KIND, input_scaling=scaling_modes[arm], **variant_metadata)
+                    numerical_reports[arm][current_fold] = numerical
+                    numerical_path = f"folds/fold_{current_fold}/{arm}_numerical_report.json"
+                    _write_json(output / numerical_path, numerical)
+                    _write_json(output / "numerical_reports.json", numerical_reports)
+                    manifest["numerical_reports"].setdefault(current_fold, {})[arm] = numerical_path
+                    _write_predictions(output / prediction_path,
+                                       canonical_train_positions=pos["evaluation"], member_seeds=np.asarray(SEEDS),
+                                        physical_ensemble_predictions=result["prediction"],
+                                        **numerical_arrays, **prediction_metadata)
+                    manifest["prediction_artifacts"][current_fold][arm].update(status="complete", ensemble_present=True)
+                    _write_json(output / "prediction_artifacts.json", manifest["prediction_artifacts"])
+                    oof_predictions[arm][current_fold] = (pos["evaluation"].copy(), result["prediction"].copy())
                 rows = _metric_rows(report, fold_id=current_fold, arm=arm, predictor=predictor,
                                     aggregation=result["method"], member_seeds="42,43,44")
                 ensemble_rows.extend(rows)
@@ -370,7 +668,7 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
                 manifest["ensemble_reports"][current_fold][arm] = path
                 manifest["completed_ensemble_evaluations"] += 1
                 checkpoint()
-                del member_predictions, result
+                del member_predictions, raw_predictions, result
             del evaluation, diagnostics_frame
             print(f"[Fold {current_fold + 1}/3] six fresh members and both ensembles evaluated", flush=True)
             gc.collect()
@@ -381,11 +679,15 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
             raise RuntimeError("All 18 fits and every fold/member/ensemble evaluation must finish before selection.")
         manifest["phase"] = "fold_selection"
         checkpoint()
-        gates = {f"{arm}_ensemble": paired_fold_gate(references, candidates[arm], expected_geometry_ids=fold_plan["geometry_ids"])
-                 for arm in _ARMS}
+        gate_function = paired_input_scaling_fold_gate if input_scaling else paired_fold_gate
+        if variant_metadata:
+            gate_function = paired_selective_scaling_fold_gate
+        gated_arms = arms[1:] if input_scaling else arms
+        gates = {f"{arm}_ensemble": gate_function(references, candidates[arm], expected_geometry_ids=fold_plan["geometry_ids"])
+                 for arm in gated_arms}
         _write_json(output / "gates.json", gates)
         family_scores = {}
-        for arm in _ARMS:
+        for arm in arms:
             values = [candidates[arm][fold_id]["targets"]["Cd"]["median_relative_error"] for fold_id in range(3)]
             finite = all(isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value) for value in values)
             family_scores[f"{arm}_ensemble"] = {
@@ -405,6 +707,38 @@ def run_fold_study(split, feature_columns, target_names, output_dir, run_metadat
             "fallback_reason": None if eligible else "No eligible ensemble family; failed/inconclusive gates retain predeclared baseline_seed_42.",
             "confidence_calibrated": False, "old_test_improvement_claim": False,
         }
+        if input_scaling:
+            safety = {f"{arm}_ensemble": _input_scaling_safety(candidates[arm], numerical_reports[arm]) for arm in arms}
+            if variant_metadata:
+                for arm in arms:
+                    safety[f"{arm}_ensemble"].update(input_scaling=scaling_modes[arm], **variant_metadata)
+            _write_json(output / "numerical_safety.json", safety)
+            pooled = {f"{arm}_ensemble": _pooled_oof_scores(train, targets, oof_predictions[arm]) for arm in arms}
+            if variant_metadata:
+                for arm in arms:
+                    pooled[f"{arm}_ensemble"].update(predictor=f"{arm}_ensemble", input_scaling=scaling_modes[arm], **variant_metadata)
+            _write_json(output / "pooled_oof.json", pooled)
+            study._write_csv(output / "pooled_oof_metrics.csv", [
+                {"predictor": family, "source": _SOURCE, "study_kind": _INPUT_SCALING_STUDY_KIND,
+                  "target": target, "n_predictions": report["n_rows"], "row_sha256": report["row_sha256"],
+                  "score_scope": "pooled_oof_all_canonical_train_rows", **scores,
+                  **({"input_scaling": report["input_scaling"], **variant_metadata} if variant_metadata else {})}
+                for family, report in pooled.items() for target, scores in report["targets"].items()
+            ])
+            manifest["pooled_oof"] = pooled
+            candidate_family = f"{arms[1]}_ensemble"
+            selected = candidate_family if gates[candidate_family]["passed"] and safety[candidate_family]["passed"] else None
+            selection.update(
+                study_kind=_INPUT_SCALING_STUDY_KIND, selected_family=selected, reference=f"{arms[0]}_ensemble",
+                member_seeds=list(SEEDS) if selected else [], numerical_safety=safety,
+                relative_gate_passed=gates[candidate_family]["passed"], candidate_numerically_safe=safety[candidate_family]["passed"],
+                reference_numerically_safe=safety[f"{arms[0]}_ensemble"]["passed"],
+                production_promotion=False, new_recommendation=selected is not None, fallback_family=None,
+                fallback_reason=None if selected else "No new recommendation: candidate relative gate or numerical safety failed/inconclusive; reference safety is reported separately, not assumed.",
+                **variant_metadata,
+            )
+            if variant_metadata:
+                selection["input_scaling_modes"] = deepcopy(scaling_modes)
         # Fresh output is required and this decision file is written exactly once.
         _write_json(output / "fold_selection.json", selection)
         manifest["selection"] = selection

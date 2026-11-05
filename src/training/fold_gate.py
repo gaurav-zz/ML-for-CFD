@@ -19,6 +19,8 @@ from src.training.tail_risk import DEFINITIONS, SCORES, TAIL_METRICS, TARGETS
 
 FOLDS = (0, 1, 2)
 SOURCE = "canonical_train_geometry_fold_evaluation"
+INPUT_SCALING_STUDY_KIND = "paired_geometry_input_scaling"
+INPUT_SCALING_ARMS = ("cdp_column_scaling", "cdp_profile_scaling")
 POLICY = {
     "median_fraction_tolerance": .005,
     "mean_tail_relative_tolerance": .05,
@@ -46,7 +48,7 @@ def _geometry_ids(value):
     return set(value)
 
 
-def _validate_report(item, fold, arm):
+def _validate_report(item, fold, arm, *, input_scaling=None):
     if not isinstance(item, dict):
         raise ValueError("Every fold requires a complete tail-report dictionary.")
     json.dumps(item, allow_nan=False)
@@ -57,9 +59,17 @@ def _validate_report(item, fold, arm):
     if item["source"] != SOURCE:
         raise ValueError("Reports must come from canonical_train_geometry_fold_evaluation, never canonical test.")
     if ("seeds" in item or item.get("unit", "geometry_fold") != "geometry_fold"
-            or ("seed" in item and (arm != "reference" or type(item["seed"]) is not int or item["seed"] != 42))):
+            or ("seed" in item and (input_scaling or arm != "reference" or type(item["seed"]) is not int or item["seed"] != 42))):
         raise ValueError("Geometry folds must not be labeled as independent seeds or other units.")
-    if arm == "reference":
+    if input_scaling:
+        expected_arm = INPUT_SCALING_ARMS[0 if arm == "reference" else 1]
+        expected_scaling = "standard" if arm == "reference" else input_scaling
+        if (item["study_kind"] != INPUT_SCALING_STUDY_KIND
+                or item["arm"] != expected_arm or item["input_scaling"] != expected_scaling
+                or item["predictor"] != f"{expected_arm}_ensemble"
+                or item["member_seeds"] != list(SEEDS) or item["aggregation"] != METHOD):
+            raise ValueError("Input-scaling gate requires truthful column/profile Cdp ensemble labels, scaling modes, and all seeds [42,43,44].")
+    elif arm == "reference":
         if item["predictor"] != "baseline_seed_42" or item["member_seeds"] != [42]:
             raise ValueError("Reference must be predeclared baseline_seed_42 with member_seeds=[42], never best seed.")
     elif (item["predictor"] not in ("baseline_ensemble", "cdp_ensemble")
@@ -143,6 +153,29 @@ def paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids
     Invalid/incomplete evidence is inconclusive, never a reduced-fold average.
     This helper gates one family; it neither selects a family nor a best fold.
     """
+    return _paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids)
+
+
+def paired_input_scaling_fold_gate(reference_reports, candidate_reports, expected_geometry_ids=None):
+    """Apply the historical 17 relative checks to the frozen scaling ensembles.
+
+    The reference is cdp_column_scaling_ensemble, not a single seed or baseline.
+    This relative gate does not certify numerical safety or recommend a model.
+    """
+    return _paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids, input_scaling="profile_rms_floor")
+
+
+def paired_selective_scaling_fold_gate(reference_reports, candidate_reports, expected_geometry_ids=None):
+    """Apply the unchanged 17 relative checks to the fixed 1%-RMS candidate.
+
+    Expected modes are fixed here, never inferred from supplied reports. Historical
+    full-RMS evidence is not selective evidence; numerical safety remains separate.
+    """
+    return _paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids,
+                             input_scaling="profile_rms_floor_1pct")
+
+
+def _paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids, *, input_scaling=None):
     report = {
         "schema_version": 1, "source": SOURCE, "unit": "geometry_fold", "gated_units": ["geometry_fold"],
         "folds": list(FOLDS), "n_folds": 3, "seed_selection": False, "fold_selection": False,
@@ -152,8 +185,15 @@ def paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids
                      "Tail-report summaries are engineering evidence, not certified physical laws or abstention guarantees."],
         "fold_stats": [], "mean_stats": {},
     }
+    if input_scaling:
+        report.update(study_kind=INPUT_SCALING_STUDY_KIND, numerical_safety_checked=False)
+        if input_scaling == "profile_rms_floor_1pct":
+            report["study_variant"] = "selective_profile_floor_1pct"
     arms, values, identities = {}, {}, {}
     try:
+        if input_scaling is not None and (not isinstance(input_scaling, str)
+                or input_scaling not in ("profile_rms_floor", "profile_rms_floor_1pct")):
+            raise ValueError("Fold gate requires a predeclared full-RMS or selective 1%-RMS mode.")
         expected = None if expected_geometry_ids is None else _geometry_ids(expected_geometry_ids)
         for arm, supplied in (("reference", reference_reports), ("candidate", candidate_reports)):
             if (not isinstance(supplied, dict) or len(supplied) != 3
@@ -162,7 +202,7 @@ def paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids
                 raise ValueError(f"{arm} requires exactly geometry folds 0, 1, 2, not seed IDs.")
             arms[arm] = {int(key): value for key, value in supplied.items()}
             for fold in FOLDS:
-                identities[arm, fold], values[arm, fold] = _validate_report(arms[arm][fold], fold, arm)
+                identities[arm, fold], values[arm, fold] = _validate_report(arms[arm][fold], fold, arm, input_scaling=input_scaling)
         family = arms["candidate"][0]["predictor"]
         if any(arms["candidate"][fold]["predictor"] != family for fold in FOLDS):
             raise ValueError("All candidate folds must evaluate the same predeclared ensemble family.")
@@ -180,7 +220,7 @@ def paired_fold_gate(reference_reports, candidate_reports, expected_geometry_ids
         report["expected_geometry_ids_validated"] = expected is not None
         if expected is None:
             report["warnings"].append("Canonical-training geometry union was not independently declared; source metadata alone is not a membership proof.")
-        report["reference_predictor"] = "baseline_seed_42"
+        report["reference_predictor"] = f"{INPUT_SCALING_ARMS[0]}_ensemble" if input_scaling else "baseline_seed_42"
         report["candidate_predictor"] = family
         report["aggregation"] = METHOD
         report["fold_stats"] = [{"fold_id": fold, "weight": 1 / 3,
